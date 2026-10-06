@@ -24,6 +24,7 @@
 #include "FileIO/BasicChunk1.h"
 #include "FileIO/FilesPackage.h"
 #include "Script/Script.h"
+#include "Script/lobject.h"
 #include "ADOImport/BasicDB.h"
 #include "DBFormat/DataFormat.h"
 #include "DBFormat/DataAnimation.h"
@@ -38,6 +39,9 @@
 #include "dxt_decode.h"
 #ifdef __ANDROID__
 #include "d3d_selftest.h"
+#endif
+#ifdef A5_HAVE_MAIN
+#include "Main/GRenderCore.h"
 #endif
 
 #define LOGI( ... ) a5_log( A5_PRIORITY_INFO,  __VA_ARGS__ )
@@ -852,6 +856,15 @@ void CheckScripting( CReport *pReport )
 {
     pReport->Add( BOOT_HEADING, 0, "Script: Lua 4.0 virtual machine" );
 
+    // Unused stack capacity is serialized too. Poison storage so this check
+    // cannot pass merely because an allocator returned zero-filled memory.
+    alignas(TObject) unsigned char slot[sizeof(TObject)];
+    memset( slot, 0xA5, sizeof(slot) );
+    TObject *emptySlot = new (slot) TObject;
+    pReport->Add( emptySlot->GetType() == LUA_TNIL ? BOOT_OK : BOOT_FAIL, 0,
+                  "new Lua stack slots start as nil even in reused memory" );
+    emptySlot->~TObject();
+
     NHPTimer::STime t;
     NHPTimer::GetTime( &t );
 
@@ -999,6 +1012,32 @@ SBootReport RunBootHarness( const char *pszExternalFilesDir,
     CheckGameDatabase( &report, mount );
     CheckTextures( &report, mount );
     CheckScripting( &report );
+#ifdef A5_HAVE_MAIN
+    // Exercise the real renderer's partitioning, preserving existing lower
+    // passes and the relative order/data of both resulting lists.
+    bool splitOK = true;
+    for ( int count = 0; count <= 7; ++count )
+        for ( int mask = 0; mask < ( 1 << count ); ++mask )
+        {
+            NGScene::CRenderCmdList source, lower;
+            vector<float> expectedLow( 1, 99 ), expectedHigh;
+            lower.ops.push_back( NGScene::CRenderCmdList::SOperation( 0, NGScene::RO_NOP, 1, 0, 0, 99.0f ) );
+            for ( int i = 0; i < count; ++i )
+            {
+                const bool low = ( mask & ( 1 << i ) ) != 0;
+                source.ops.push_back( NGScene::CRenderCmdList::SOperation( 0, NGScene::RO_NOP, low ? 10 : 30, 0, 0, float(i) ) );
+                ( low ? expectedLow : expectedHigh ).push_back( float(i) );
+            }
+            NGScene::SplitOps( &lower, &source, 30 );
+            splitOK &= lower.ops.size() == expectedLow.size() && source.ops.size() == expectedHigh.size();
+            for ( size_t i = 0; i < lower.ops.size() && i < expectedLow.size(); ++i )
+                splitOK &= lower.ops[i].p1.f == expectedLow[i] && lower.ops[i].nPass < 30;
+            for ( size_t i = 0; i < source.ops.size() && i < expectedHigh.size(); ++i )
+                splitOK &= source.ops[i].p1.f == expectedHigh[i] && source.ops[i].nPass >= 30;
+        }
+    report.Add( splitOK ? BOOT_OK : BOOT_FAIL, 0,
+                "render-pass split preserves both lists for every partition of up to seven draws" );
+#endif
     CheckGameScripts( &report, mount );
 #ifdef __ANDROID__
     /* Needs a current GL context: android_main runs the harness after InitDisplay. */

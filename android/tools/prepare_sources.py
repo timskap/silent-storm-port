@@ -4744,6 +4744,61 @@ static bool DoesLooseFileExist( const string &name )
 ]
 
 
+# Rule set 26: reviewed, platform-independent fixes from the merged
+# met-nikita/Silent-Storm-Reconstruction tree. See docs/RECONSTRUCTION.md for
+# commit provenance and the boundary between the imported and Android engines.
+RULES += [
+    (
+        "Main/GRenderCore.cpp",
+        "Reconstruction 8b4d7a8bd: compact retained passes in their source list, not the lower-pass destination.",
+        "pLower->ops[ nDest++ ] = pSrc->ops[k];",
+        "pSrc->ops[ nDest++ ] = pSrc->ops[k];",
+    ),
+    (
+        "Main/MapBuild.cpp",
+        "Reconstruction b14bbb4f2 (MapBuild): initialize building-object offsets before rotation.",
+        "\t\tCVec3 ptShift;\n\t\tif ( bSolids )",
+        "\t\tCVec3 ptShift( 0, 0, 0 );\n\t\tif ( bSolids )",
+    ),
+    (
+        "Script/lobject.h",
+        "Reconstruction dbb74c6e6 (Lua): unused stack slots have a valid nil tag before save/GC visits them.",
+        "\tTObject() {}",
+        "\tTObject(): ttype( LUA_TNIL ) {}",
+    ),
+    (
+        "Main/GRenderLight.cpp",
+        "Reconstruction 07e6ad72e: skip inactive and tiny animated lights before radius calculations.",
+        "if ( fabs2( lColor ) < 0.001f || l.bEnd )",
+        "if ( fabs2( lColor ) < 0.001f || l.bEnd || !l.bActive || l.fRadius < 0.1f )",
+    ),
+    (
+        "Main/GAnimation.cpp",
+        "Reconstruction 5d97df475 (aimer): return the target pose at the exact animation endpoint.",
+        "if ( t > tNext || tCurrent == tNext )",
+        "if ( t >= tNext || tCurrent == tNext )",
+    ),
+    (
+        "Main/GLightmapCalc.cpp",
+        "Reconstruction 5d97df475 (null scene): omit shadow tracing when no visibility scene is supplied.",
+        "if ( fDist > fTargetR )",
+        "if ( pVis && fDist > fTargetR )",
+    ),
+    (
+        "Main/aiInventory.cpp",
+        "Reconstruction 789470fe4: an AI weapon wrapper can outlive its RPG item; skip invalid items.",
+        "\t\tCPtr<NRPG::CWeaponItem> pWeaponItem( (*i)->GetItem() );\n\t\tint nHitCover",
+        "\t\tCPtr<NRPG::CWeaponItem> pWeaponItem( (*i)->GetItem() );\n\t\tif ( !IsValid( pWeaponItem ) )\n\t\t\tcontinue;\n\t\tint nHitCover",
+    ),
+    (
+        "Main/scFlowChartItems.cpp",
+        "Reconstruction f74265771: newly created clues have no map template until placed.",
+        "bInShortestPath( false ),\tnInnerID( _nInnerID ), bDestroyed( false )",
+        "bInShortestPath( false ),\tnInnerID( _nInnerID ), nTemplateID( 0 ), bDestroyed( false )",
+    ),
+]
+
+
 def apply_rules(text, rel_path, applied, unmatched):
     """Apply every rule whose file pattern matches.
 

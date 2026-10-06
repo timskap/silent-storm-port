@@ -27,6 +27,7 @@ In 2026, the game's source code was released under a [special license](LICENSE.m
 - `cfg/` — configuration files
 - `Versions/Current` — developer version
 - `android/` — Android (NDK) port of the engine — see [android/README.md](android/README.md)
+- `reconstruction/` — complete [Silent-Storm-Reconstruction](https://github.com/met-nikita/Silent-Storm-Reconstruction) source tree and Windows build, merged with its history. See [integration notes](android/docs/RECONSTRUCTION.md) for the pinned revision and fixes enabled in Android.
 
 ---
 
@@ -45,10 +46,9 @@ By default, the game runs in windowed mode at 800x600 resolution. For windowed m
 
 # Android
 
-The `android/` directory builds the engine for Android with the NDK. The engine
-core — file I/O, the `.res` package reader, the chunk serialiser and the Lua 4
-virtual machine — runs on device against real game data; the Direct3D renderer,
-audio and the game layer are not ported yet.
+The `android/` directory builds the engine for Android with the NDK. Menus and
+a mission run on device with a GLES renderer, touch input and audio. The port
+targets 30 FPS; see the [measured status and remaining limits](android/docs/PORTING.md).
 
 ```bash
 cd android

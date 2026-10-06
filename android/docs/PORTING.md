@@ -224,13 +224,25 @@ and low-resolution assets, then uses the database average colour for missing
 files. This does not restore the absent artwork; malformed/unsupported files
 still produce diagnostics.
 
-The expanded device harness passes 51 checks, including sparse 16/32-bit
+The expanded device harness passes 53 checks, including sparse 16/32-bit
 indices, negative base vertices, stream offsets, reuse across Present, changed
 geometry, shader wrapper lifetimes, and EQUAL-depth multipass pixels, with two
-existing data/UI warnings. Host checks pass (38 checks plus CTest's frame
+existing data/UI warnings. Host checks pass (39 checks plus CTest's frame
 schedule and BSP-cache regressions). ARM64 full-game and ARMv7 harness builds
 compile. A full campaign, all maps, and true GPU context-loss recovery remain
 outside this validation.
+
+**Reconstruction merge (2026-10-07, rule set 26).** The complete upstream tree
+and history are retained under `reconstruction/`; eight reviewed changes are
+also enabled in the Android engine. These cover render-pass partitioning,
+building offsets, animated lights, animation endpoints, null shadow scenes,
+Lua value initialization, invalid AI weapons and clue template initialization.
+See [the integration record](RECONSTRUCTION.md) for exact commit provenance
+and which changes are active. ARM64 and ARMv7 builds pass; the device harness
+passes 53 checks and the host 39. The default renderer was tested without a
+buffer-mode override: a wide building view at `(17.20,22.73,0), rod=31.2`
+measured 28.8–29.5 FPS, p95 43–50 ms, with no GL errors. Background/return
+retained the mission and GL context in the preceding compact-buffer build.
 
 Three bugs found on the way that were invisible before and affect *everything*
 (details in Traps): DB cross-references imported from a file where the target
