@@ -368,21 +368,16 @@ differences — is [RENDERER.md](RENDERER.md). In short:
   control names mapped to Android key codes, mouse buttons and wheel; touches
   become an absolute pointer position (`a5_set_pointer_position`) that
   `Cursor.cpp` reads in preference to integrated deltas (staging rule).
-  `Bind.cpp` (action mapping) is portable and sits on top. Camera gestures ride
-  the retail binds (`cfg/input.cfg`): a two-finger **pinch** is the mouse wheel
-  (`-camera_zoom 'MOUSE_AXIS_Z'`), a two-finger **drag** holds `MOUSE_BUTTON2`
-  and feeds `MOUSE_AXIS_X/Y` deltas — the PC middle-button pan
-  (`+camera_forward` / `-camera_strafe`) — and a two-finger **tap** is still the
-  right click. Rotation rides the right-button binds: a two-finger **twist**
-  (the finger line turning >10° before the drag slop trips) holds
-  `MOUSE_BUTTON1` and feeds `MOUSE_AXIS_X` (`-camera_rotate`), and a
-  **three-finger drag** is the whole PC right-button drag — horizontal rotates,
-  vertical tilts (`-camera_pitch`). A gesture is one mode for its whole life
-  (pan/zoom, twist, or orbit) because pan holds button 2 and rotation holds
-  button 1, and with both held one axis message would drive both camera binds.
-  So a starting pinch never lands as a phantom left click, a single finger's
-  press is held back ~90 ms (or until it moves/lifts) before it reaches the
-  engine.
+  `Bind.cpp` (action mapping) remains in place for physical keys and mouse.
+  Touch camera gestures use independent floating-point channels (rule set 27):
+  two-finger drag pans, pinch scales the camera distance proportionally, and
+  twist rotates. Each channel has its own dead zone, so starting a pan no
+  longer prevents rotation later in the same gesture. Motion settles through
+  a 55 ms time-based filter. Pan speed follows camera distance; zoom and twist
+  gains are 0.8 and 0.85. Three-finger drag rotates/tilts; two-finger tap remains
+  right click. Cancellation/focus loss clears pending camera movement.
+  A single finger's press is held back ~90 ms (or until it moves/lifts) before
+  it reaches the engine to avoid a click at the start of a pinch.
 * **Audio** — done for what can be exercised so far. `FModSound/FMsound.h` is
   the seam (Main only ever calls `NFMSound::*`); `platform/audio_android.cpp`
   implements it on a software mixer of its own: 64 sample voices + streams,
@@ -416,8 +411,14 @@ differences — is [RENDERER.md](RENDERER.md). In short:
 * **Video**: Bink is licensed and absent. Cutscenes should be skipped or the
   container replaced; nothing else depends on it.
 * **LifeStudio:HEAD** (facial animation for dialogue heads, proprietary) is
-  stubbed under `compat/include/thirdparty-stubs/`: heads render in their neutral
-  pose. Reviving it means licensing the SDK or writing a macro-muscle deformer.
+  partially implemented under `compat/include/thirdparty-stubs/`. The original
+  no-op stub left vertex positions zero: heads were missing in both HUD and
+  world views. `head_neutral.h` now decodes indexed neutral positions in both
+  animator formats (signatures AD5A018D and 37D30DC0), including vertices outside
+  muscle groups. Bounds, duplicate/out-of-range indices, non-finite positions
+  and destination capacity are checked. All 134 local Heads assets / 136
+  streams / 56,462 vertices decode. Facial deformation and lip sync remain
+  unimplemented; the pose is static.
 
 ### 5. The game layer
 
@@ -603,3 +604,28 @@ percentiles, work/swap time, skipped draws and GL errors every five seconds.
 is an explicit opt-out for a build that has just completed. The host target builds in
 seconds and is debuggable with lldb, which is how the 64-bit stream bug above was
 found — do not debug engine logic on a device if the host can reproduce it.
+
+### Touch, heads and shadow precision (2026-10-07)
+
+Rule set 27 integrates touch-camera channels, bounded neutral head output and
+retail HUD compatibility. Complete's turn controls are CPushButton templates
+with StringID 19971/19972 already set; removing the historical baked-text image
+379/469 avoids a second caption. The retail background_empty plate now only
+shows with no selected units. This follows the imported Reconstruction HUD
+finding, adapted to this port's existing CPushButton text handling.
+
+Generated GLES fragment shaders and samplers now use highp: shadow comparisons
+subtract closely spaced depth values before amplification, which mediump can
+round to the same number. The device regression renders the actual psShadowTest
+with depth deltas of +/-0.00006. This tests arithmetic precision, not every
+possible source of temporal shadow flicker.
+
+Validation: four host CTests, 39 host boot checks, and 54 device boot checks
+passed (the two existing boot warnings remain). The device screenshot confirms
+neutral heads in the HUD/world and a single START COMBAT caption. Host tests
+cover jitter, pan followed by twist/pinch, angle wrapping, frame-rate-independent
+settling, cancellation, both head formats, truncation and malformed indices.
+The user then verified combined camera controls, faces and distant shadows on
+the connected Galaxy Z Fold7 and reported that all worked. ARM64 full-game and
+ARMv7 harness builds passed. The original device environment was restored after
+the check; no temporary camera placement is enabled for subsequent launches.

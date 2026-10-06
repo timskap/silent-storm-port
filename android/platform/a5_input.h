@@ -2,7 +2,11 @@
 #ifndef A5_INPUT_H
 #define A5_INPUT_H
 #ifdef __cplusplus
+#include "touch_camera.h"
 extern "C" {
+void a5_input_camera_motion( const A5CameraMotion *motion );
+void a5_input_camera_pull( A5CameraMotion *motion );
+void a5_input_camera_cancel();
 #endif
 void a5_input_key( int nAndroidKeyCode, int bDown );
 void a5_input_mouse_button( int nButton, int bDown );    /* 0 left, 1 right, 2 middle */

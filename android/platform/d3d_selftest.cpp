@@ -434,6 +434,27 @@ void RunD3DSelfTest( void *pReporter, ReportFn pfnAdd )
     }
     pShot->UnlockRect();
 
+    // Shadow subtraction must retain sub-mediump depth differences before
+    // amplification. The real psShadowTest reads the texture's green channel.
+    bool shadowPrecisionOK = true;
+    pDev->SetVertexShader(pVSConst);
+    pDev->SetPixelShader(ps[22]);
+    const float shadowScale[4] = {0, 8192, 0, 0};
+    pDev->SetPixelShaderConstantF(0, shadowScale, 1);
+    for (int sample = 0; sample < 6; ++sample) {
+        const float delta = (sample & 1) ? -0.00006f : 0.00006f;
+        const float depth[4] = {0, 128.0f/255.0f - delta, 0, 0};
+        pDev->SetVertexShaderConstantF(16, depth, 1);
+        pDev->Clear(0, 0, D3DCLEAR_TARGET, 0, 1, 0);
+        pDev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1);
+        pDev->GetFrontBufferData(0, pShot);
+        pShot->LockRect(&lr, 0, D3DLOCK_READONLY);
+        const unsigned char *pixel = (const unsigned char *)lr.pBits + 245*lr.Pitch + 10*4;
+        shadowPrecisionOK &= (sample & 1) ? pixel[1] < 3 : (pixel[1] >= 120 && pixel[1] <= 131);
+        pShot->UnlockRect();
+    }
+    R(shadowPrecisionOK ? BOOT_OK : BOOT_FAIL, "shadow shader retains nearby depth differences (0.00006) without flickering thresholds");
+
     // The depth prepass and lighting use different vertex programs. Compare
     // EQUAL-tested lighting against the same draw without a depth test over
     // several nontrivial transforms, including every covered pixel.

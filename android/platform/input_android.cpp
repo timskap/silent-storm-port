@@ -15,15 +15,8 @@
  *                               the engine's cursor reads it (see the Cursor.cpp
  *                               rule) instead of integrating MOUSE_AXIS deltas
  *   - hardware keys          -> the named key (ESC, ENTER, arrows, letters...)
- *   - two-finger pinch       -> MOUSE_AXIS_Z (wheel): camera zoom
- *   - two-finger drag        -> MOUSE_BUTTON2 held + MOUSE_AXIS_X/Y deltas:
- *                               the PC middle-button camera pan
- *                               (input.cfg: camera_forward/camera_strafe)
- *   - two-finger twist       -> MOUSE_BUTTON1 held + MOUSE_AXIS_X deltas:
- *                               camera rotation (input.cfg: camera_rotate)
- *   - three-finger drag      -> MOUSE_BUTTON1 held + MOUSE_AXIS_X/Y deltas:
- *                               the PC right-button drag -- rotate and tilt
- *                               (input.cfg: camera_rotate/camera_pitch)
+ *   - multi-finger camera motion -> independent floating-point pan/zoom/twist
+ *     consumed by the camera, smoothed in time without mouse-button conflicts.
  *
  *  Nothing here knows about the game; a5_input_* is what android_main calls.
  */
@@ -271,4 +264,18 @@ extern "C" void a5_input_wheel( int nDelta )
 extern "C" void a5_input_axis( int nAxis, int nDelta )
 {
     NInput::Push( nAxis == 0 ? NInput::g_nAxisX : NInput::g_nAxisY, true, nDelta );
+}
+
+// Called only on the game thread, after the Android event queue is drained.
+namespace {
+A5CameraSmoother g_cameraMotion;
+unsigned long g_cameraTime = 0;
+}
+extern "C" void a5_input_camera_motion(const A5CameraMotion *motion) { g_cameraMotion.add(*motion); }
+extern "C" void a5_input_camera_cancel() { g_cameraMotion.reset(); g_cameraTime = 0; }
+extern "C" void a5_input_camera_pull(A5CameraMotion *motion) {
+    const unsigned long now = GetTickCount();
+    const float seconds = g_cameraTime ? float(now - g_cameraTime) * 0.001f : 1.0f/30.0f;
+    g_cameraTime = now;
+    *motion = g_cameraMotion.consume(seconds);
 }

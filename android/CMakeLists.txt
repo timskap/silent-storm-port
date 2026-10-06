@@ -22,6 +22,11 @@ if(BUILD_TESTING AND NOT ANDROID)
     add_executable(silentstorm_frame_schedule_test tools/frame_schedule_test.cpp)
     target_compile_options(silentstorm_frame_schedule_test PRIVATE -UNDEBUG)
     add_test(NAME frame_schedule COMMAND silentstorm_frame_schedule_test)
+    foreach(check touch_camera head_neutral)
+        add_executable(silentstorm_${check}_test tools/${check}_test.cpp)
+        target_compile_options(silentstorm_${check}_test PRIVATE -UNDEBUG)
+        add_test(NAME ${check} COMMAND silentstorm_${check}_test)
+    endforeach()
 endif()
 
 #  ENGINE_GEN may be overridden (-DENGINE_GEN=... / A5_GEN_DIR for build.sh) so

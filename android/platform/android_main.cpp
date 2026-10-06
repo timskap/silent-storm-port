@@ -53,15 +53,8 @@ namespace {
  *  passed with game data mounted; otherwise the console stays up and says why. */
 enum ERunMode { RUN_CONSOLE, RUN_GAME };
 
-/*  What a two-or-more-finger touch has turned out to be.  UNDECIDED until the
- *  movement clears a threshold (a release there is the two-finger tap = right
- *  click); PANZOOM and TWIST are two-finger modes, ORBIT is the three-finger
- *  drag.  One mode per gesture: the classification never changes mid-gesture
- *  except UNDECIDED -> decided and PANZOOM/TWIST <-> ORBIT on the third
- *  finger, because the pan (button 2 + axes) and the rotation (button 1 +
- *  axes) must not hold their buttons at the same time -- with both held one
- *  axis message would drive both camera binds at once. */
-enum EGestureMode { GM_UNDECIDED, GM_PANZOOM, GM_TWIST, GM_ORBIT };
+// Two fingers combine pan, pinch and twist; the third finger switches to tilt.
+enum EGestureMode { GM_UNDECIDED, GM_PANZOOM, GM_ORBIT };
 
 struct SEngineState
 {
@@ -100,16 +93,8 @@ struct SEngineState
      *  gesture that began outside the image. */
     bool  bPressInside       = false;
 
-    /*  One finger is the mouse; two fingers are a camera gesture -- pinch is
-     *  the wheel (camera_zoom), drag holds the middle button and feeds
-     *  MOUSE_AXIS deltas (the PC middle-drag pan), twist holds the right
-     *  button and feeds MOUSE_AXIS_X (camera_rotate), a quick tap is the
-     *  right click; a third finger switches to orbit -- the full PC
-     *  right-button drag (horizontal rotates, vertical tilts).  So that the
-     *  first finger's press does not land as a phantom left click the moment
-     *  a pinch starts, the press is held back for F_PRESS_DELAY seconds (or
-     *  until it moves / lifts) -- a second finger arriving within that window
-     *  turns the touch into a gesture with no click ever delivered. */
+    /* Delay a single-finger press so adding a second finger does not click.
+     * Camera gestures use independent floating-point channels. */
     bool   bPressPending     = false;    /* left press seen, not yet delivered */
     bool   bPressSent        = false;    /* left button currently held in the engine */
     double fPressTime        = 0.0;
@@ -117,18 +102,10 @@ struct SEngineState
     float  fPressY           = 0.0f;
     bool   bGesture          = false;    /* two tracked fingers on screen */
     EGestureMode eGestureMode = GM_UNDECIDED;
-    bool   bPanning          = false;    /* middle button (2) held in the engine */
-    bool   bRotating         = false;    /* right button (1) held in the engine */
+    A5TouchCamera touchCamera;
     int    nGestureId0       = -1;       /* pointer ids of the two tracked fingers */
     int    nGestureId1       = -1;
     float  fGestX0 = 0, fGestY0 = 0, fGestX1 = 0, fGestY1 = 0;
-    float  fGestTravel       = 0.0f;     /* movement so far, for the tap slop */
-    float  fGestAngle0       = 0.0f;     /* finger-line angle at gesture start */
-    float  fWheelAccum       = 0.0f;     /* fractional wheel param not yet pushed */
-    float  fPanAccumX        = 0.0f;     /* fractional axis deltas not yet pushed */
-    float  fPanAccumY        = 0.0f;
-    float  fRotAccum         = 0.0f;     /* fractional twist axis-X not yet pushed */
-
     /*  Soft keyboard: raised while the engine draws a focused edit box
      *  (a5_edit_was_active), lowered when the focus goes away. */
     bool   bKeyboardShown    = false;
@@ -434,24 +411,6 @@ float GestureSlop( const SEngineState *pState )
     const int nMax = pState->nWidth > pState->nHeight ? pState->nWidth : pState->nHeight;
     return 0.012f * nMax;                /* ~30 px on a 2520-wide screen */
 }
-float PinchPixelsPerNotch( const SEngineState *pState )
-{
-    const int nMax = pState->nWidth > pState->nHeight ? pState->nWidth : pState->nHeight;
-    return 0.03f * nMax;                 /* ~75 px of finger spread per wheel notch */
-}
-/*  Twist: how far the line between the two fingers must turn before the
- *  gesture is a rotation rather than a pan/zoom, and how many back-buffer
- *  pixels of MOUSE_AXIS_X one degree of twist feeds into the camera_rotate
- *  bind ('MOUSE_BUTTON1' + 'MOUSE_AXIS_X', the PC right-button drag). */
-const float F_TWIST_DECIDE_RAD  = 0.17f;   /* ~10 degrees */
-const float F_TWIST_PX_PER_DEG  = 6.0f;
-float WrapAngle( float fA )                /* into (-pi, pi] */
-{
-    while ( fA >  (float)M_PI ) fA -= 2.0f * (float)M_PI;
-    while ( fA <= -(float)M_PI ) fA += 2.0f * (float)M_PI;
-    return fA;
-}
-
 /*  Deliver the held-back left press: called once the touch is known to be a
  *  single-finger press (it moved, lifted, or outlived the delay), never when
  *  a second finger made it a gesture. */
@@ -470,8 +429,8 @@ void FlushPendingPress( SEngineState *pState )
 
 /*  A gesture MOVE: zoom by the change of the finger distance, pan by the
  *  movement of the midpoint, rotate by the turn of the finger line (twist) or
- *  by the midpoint drag when a third finger is down (orbit).  Nothing is fed
- *  until the movement decides the mode, so a two-finger tap stays a tap. */
+ *  by the midpoint drag when a third finger is down (orbit). Independent dead
+ *  zones keep two-finger taps from moving the camera. */
 void UpdateGesture( SEngineState *pState, const SQueuedInput *pEvent )
 {
     const size_t nPointers = AMotionEvent_getPointerCount( pEvent );
@@ -496,116 +455,23 @@ void UpdateGesture( SEngineState *pState, const SQueuedInput *pEvent )
     if ( nFound != 3 )
         return;
 
-    const float fOldDist = hypotf( pState->fGestX1 - pState->fGestX0, pState->fGestY1 - pState->fGestY0 );
-    const float fNewDist = hypotf( fX1 - fX0, fY1 - fY0 );
-    const float fDeltaDist = fNewDist - fOldDist;
-    const float fDeltaCX = ( fX0 + fX1 - pState->fGestX0 - pState->fGestX1 ) * 0.5f;
-    const float fDeltaCY = ( fY0 + fY1 - pState->fGestY0 - pState->fGestY1 ) * 0.5f;
-    const float fOldAngle = atan2f( pState->fGestY1 - pState->fGestY0, pState->fGestX1 - pState->fGestX0 );
-    const float fNewAngle = atan2f( fY1 - fY0, fX1 - fX0 );
-    const float fDeltaAngle = WrapAngle( fNewAngle - fOldAngle );
+    float scaleX = 1, scaleY = 1;
+    A5D3DBackBufferScale(&scaleX, &scaleY);
+    const float viewportHeight = scaleY > 0 ? 768.0f / scaleY : float(pState->nHeight);
+    A5CameraMotion motion = pState->touchCamera.move(fX0, fY0, fX1, fY1,
+                                                    viewportHeight, pState->eGestureMode == GM_ORBIT);
+    a5_input_camera_motion(&motion);
+    if (pState->eGestureMode == GM_UNDECIDED && !pState->touchCamera.isTap())
+        pState->eGestureMode = GM_PANZOOM;
     pState->fGestX0 = fX0; pState->fGestY0 = fY0;
     pState->fGestX1 = fX1; pState->fGestY1 = fY1;
-
-    if ( pState->eGestureMode == GM_UNDECIDED )
-    {
-        pState->fGestTravel += fabsf( fDeltaDist ) + fabsf( fDeltaCX ) + fabsf( fDeltaCY );
-        /*  A twist barely moves the midpoint or the distance, so the two
-         *  tests rarely race; the angle needs a baseline -- with the fingers
-         *  close together it is all noise.  Movement up to the decision is
-         *  dropped so the camera does not jump. */
-        if ( fNewDist > 3.0f * GestureSlop( pState ) &&
-             fabsf( WrapAngle( fNewAngle - pState->fGestAngle0 ) ) > F_TWIST_DECIDE_RAD )
-            pState->eGestureMode = GM_TWIST;
-        else if ( pState->fGestTravel > GestureSlop( pState ) )
-            pState->eGestureMode = GM_PANZOOM;
-        return;
-    }
-
-    if ( pState->eGestureMode == GM_TWIST )
-    {
-        /* twist -> the horizontal part of the PC right-button drag
-         * (input.cfg: -camera_rotate 'MOUSE_BUTTON1' + 'MOUSE_AXIS_X') */
-        if ( !pState->bRotating )
-        {
-            a5_input_mouse_button( 1, 1 );
-            pState->bRotating = true;
-        }
-        pState->fRotAccum += fDeltaAngle * ( 180.0f / (float)M_PI ) * F_TWIST_PX_PER_DEG;
-        const int nRot = (int)pState->fRotAccum;
-        if ( nRot != 0 ) { pState->fRotAccum -= nRot; a5_input_axis( 0, nRot ); }
-        return;
-    }
-
-    if ( pState->eGestureMode == GM_ORBIT )
-    {
-        /* three fingers -> the whole PC right-button drag: horizontal turns
-         * (camera_rotate), vertical tilts (camera_pitch).  The button goes
-         * down only once the drag clears the slop, so three fingers set down
-         * and lifted do not right-click. */
-        if ( !pState->bRotating )
-        {
-            pState->fGestTravel += fabsf( fDeltaCX ) + fabsf( fDeltaCY );
-            if ( pState->fGestTravel <= GestureSlop( pState ) )
-                return;
-            a5_input_mouse_button( 1, 1 );
-            pState->bRotating = true;
-            return;
-        }
-        float fScaleX = 1.0f, fScaleY = 1.0f;
-        A5D3DBackBufferScale( &fScaleX, &fScaleY );
-        pState->fPanAccumX += fDeltaCX * fScaleX;
-        pState->fPanAccumY += fDeltaCY * fScaleY;
-        const int nDX = (int)pState->fPanAccumX;
-        const int nDY = (int)pState->fPanAccumY;
-        if ( nDX != 0 ) { pState->fPanAccumX -= nDX; a5_input_axis( 0, nDX ); }
-        if ( nDY != 0 ) { pState->fPanAccumY -= nDY; a5_input_axis( 1, nDY ); }
-        return;
-    }
-
-    /* pinch -> wheel (input.cfg: -camera_zoom 'MOUSE_AXIS_Z'; spreading the
-     * fingers is wheel-up = zoom in) */
-    pState->fWheelAccum += fDeltaDist * ( 120.0f / PinchPixelsPerNotch( pState ) );
-    const int nWheel = (int)pState->fWheelAccum;
-    if ( nWheel != 0 )
-    {
-        pState->fWheelAccum -= nWheel;
-        a5_input_wheel( nWheel );
-    }
-
-    /* midpoint drag -> the PC middle-button pan (input.cfg: +camera_forward /
-     * -camera_strafe on 'MOUSE_BUTTON2' + axis); deltas go in back-buffer
-     * pixels so the speed matches the PC mouse at 1024x768 */
-    if ( !pState->bPanning )
-    {
-        a5_input_mouse_button( 2, 1 );
-        pState->bPanning = true;
-    }
-    float fScaleX = 1.0f, fScaleY = 1.0f;
-    A5D3DBackBufferScale( &fScaleX, &fScaleY );
-    pState->fPanAccumX += fDeltaCX * fScaleX;
-    pState->fPanAccumY += fDeltaCY * fScaleY;
-    const int nDX = (int)pState->fPanAccumX;
-    const int nDY = (int)pState->fPanAccumY;
-    if ( nDX != 0 ) { pState->fPanAccumX -= nDX; a5_input_axis( 0, nDX ); }
-    if ( nDY != 0 ) { pState->fPanAccumY -= nDY; a5_input_axis( 1, nDY ); }
 }
 
 void EndGesture( SEngineState *pState, bool bAllowTap )
 {
-    if ( !pState->bGesture )
-        return;
+    if (!bAllowTap) a5_input_camera_cancel();
+    if (!pState->bGesture) return;
     pState->bGesture = false;
-    if ( pState->bPanning )
-    {
-        a5_input_mouse_button( 2, 0 );
-        pState->bPanning = false;
-    }
-    if ( pState->bRotating )
-    {
-        a5_input_mouse_button( 1, 0 );
-        pState->bRotating = false;
-    }
     if ( bAllowTap && pState->eGestureMode == GM_UNDECIDED )
     {
         /* two-finger tap: a right click where the first finger sat */
@@ -656,34 +522,20 @@ int32_t HandleGameTouch( SEngineState *pState, const SQueuedInput *pEvent, int32
                 }
                 pState->bGesture      = true;
                 pState->eGestureMode  = GM_UNDECIDED;
-                pState->fGestTravel   = 0;
-                pState->fWheelAccum   = 0;
-                pState->fPanAccumX    = 0;
-                pState->fPanAccumY    = 0;
-                pState->fRotAccum     = 0;
+                a5_input_camera_cancel();
                 pState->nGestureId0 = AMotionEvent_getPointerId( pEvent, 0 );
                 pState->nGestureId1 = AMotionEvent_getPointerId( pEvent, 1 );
                 pState->fGestX0 = AMotionEvent_getX( pEvent, 0 );
                 pState->fGestY0 = AMotionEvent_getY( pEvent, 0 );
                 pState->fGestX1 = AMotionEvent_getX( pEvent, 1 );
                 pState->fGestY1 = AMotionEvent_getY( pEvent, 1 );
-                pState->fGestAngle0 = atan2f( pState->fGestY1 - pState->fGestY0,
-                                              pState->fGestX1 - pState->fGestX0 );
+                pState->touchCamera.begin(pState->fGestX0, pState->fGestY0, pState->fGestX1, pState->fGestY1);
             }
             else if ( pState->nTouchCount == 3 && pState->bGesture )
             {
-                /* a third finger: rotate/tilt (orbit).  The pan button must be
-                 * up before the rotate button goes down (see EGestureMode). */
-                if ( pState->bPanning )
-                {
-                    a5_input_mouse_button( 2, 0 );
-                    pState->bPanning = false;
-                }
                 pState->eGestureMode = GM_ORBIT;
-                pState->fGestTravel  = 0;
-                pState->fWheelAccum  = 0;
-                pState->fPanAccumX   = 0;
-                pState->fPanAccumY   = 0;
+                a5_input_camera_cancel();
+                pState->touchCamera.begin(pState->fGestX0, pState->fGestY0, pState->fGestX1, pState->fGestY1);
             }
             break;
 
@@ -713,16 +565,9 @@ int32_t HandleGameTouch( SEngineState *pState, const SQueuedInput *pEvent, int32
                 EndGesture( pState, true );
             else if ( pState->bGesture && pState->eGestureMode == GM_ORBIT )
             {
-                /* the third finger left: back to two-finger pan/zoom */
-                if ( pState->bRotating )
-                {
-                    a5_input_mouse_button( 1, 0 );
-                    pState->bRotating = false;
-                }
                 pState->eGestureMode = GM_PANZOOM;
-                pState->fWheelAccum  = 0;
-                pState->fPanAccumX   = 0;
-                pState->fPanAccumY   = 0;
+                a5_input_camera_cancel();
+                pState->touchCamera.begin(pState->fGestX0, pState->fGestY0, pState->fGestX1, pState->fGestY1);
             }
             --pState->nTouchCount;
             break;

@@ -4799,6 +4799,71 @@ RULES += [
 ]
 
 
+# Rule set 27: Android touch camera, neutral heads, and retail HUD compatibility.
+RULES += [
+    (
+        'Main/Camera.cpp',
+        'Consume independent touch camera channels without PC mouse-button binds.',
+        '#include "Camera.h"',
+        '#include "Camera.h"\n#include "a5_input.h"',
+    ),
+    (
+        'Main/Camera.cpp',
+        'Smooth touch pan in screen-relative units, pinch proportionally, and twist continuously.',
+        'void CCamera::Update( const STime &sTime )\n{',
+        'void CCamera::Update( const STime &sTime )\n{\n    A5CameraMotion touch;\n    a5_input_camera_pull( &touch );\n    sPlacement.fYaw += touch.yaw;\n    sPlacement.fPitch += touch.pitch;\n    const float touchSpan = 2.0f * sPlacement.fRod * tan( ToRadian(sPlacement.fFOV) * 0.5f ) * 0.65f;\n    sPlacement.fRod *= exp( -touch.zoom );',
+    ),
+    (
+        'Main/Camera.cpp',
+        'Scale touch panning with zoom and retain physical keyboard controls.',
+        'float fFwd = fwd.GetDelta() * 10.0f;\n\tfloat fStrafe = strafe.GetDelta() * 10.0f;',
+        'float fFwd = fwd.GetDelta() * 10.0f + touch.panY * touchSpan;\n\tfloat fStrafe = strafe.GetDelta() * 10.0f - touch.panX * touchSpan;',
+    ),
+    (
+        'Main/LSHead.cpp',
+        'Bound neutral-pose output to the vertex count declared by the head asset.',
+        'pLSAnimator->Process( &(value.mesh[nVert].x), 3 );',
+        'pLSAnimator->Process( &(value.mesh[nVert].x), 3, pMesh->nVertices[i] );',
+    ),
+    (
+        'Main/iUnitPanel.cpp',
+        'Retail push-button templates already draw the localized turn caption; omit the old baked-text image.',
+        '\t\t\tpEndOfTurn->AddImageState( 0, NDb::GetUITexture( 379 ) );',
+        '\t\t\t// Caption is supplied by the retail CPushButton template.',
+    ),
+    (
+        'Main/iUnitPanel.cpp',
+        'Retail push-button templates already draw the localized turn caption; omit the old baked-text image.',
+        '\t\t\tpStartOfTurn->AddImageState( 0, NDb::GetUITexture( 469 ) );',
+        '\t\t\t// Caption is supplied by the retail CPushButton template.',
+    ),
+    (
+        'Main/iUnitPanel.h',
+        'Track the retail empty-selection HUD backdrop.',
+        '\tCPtr<CImage> pBackgroundMultipleUnits;',
+        '\tCPtr<CImage> pBackgroundMultipleUnits;\n\tCPtr<CImage> pBackgroundEmpty;',
+    ),
+    (
+        'Main/iUnitPanel.h',
+        'Serialize the optional empty backdrop without shifting older tags.',
+        'f.Add(11,&pInfoPanelMultipleUnits); return 0;',
+        'f.Add(11,&pInfoPanelMultipleUnits); f.Add(12,&pBackgroundEmpty); return 0;',
+    ),
+    (
+        'Main/iUnitPanel.cpp',
+        'Bind the third retail backdrop (Reconstruction CUnitPanel fix).',
+        '\t\t\tpBackgroundMultipleUnits = GetUIWindow<CImage>( this, "background_multi" );',
+        '\t\t\tpBackgroundMultipleUnits = GetUIWindow<CImage>( this, "background_multi" );\n\t\t\tpBackgroundEmpty = GetUIWindow<CImage>( this, "background_empty" );',
+    ),
+    (
+        'Main/iUnitPanel.cpp',
+        'Only show the empty backdrop when no unit is selected.',
+        '\tpBackgroundMultipleUnits->SetStyle( STYLE_VISIBLE, bMultiPanel );',
+        '\tpBackgroundMultipleUnits->SetStyle( STYLE_VISIBLE, bMultiPanel );\n\tif ( IsValid(pBackgroundEmpty) ) pBackgroundEmpty->SetStyle( STYLE_VISIBLE, nCountSelected == 0 );',
+    ),
+]
+
+
 def apply_rules(text, rel_path, applied, unmatched):
     """Apply every rule whose file pattern matches.
 

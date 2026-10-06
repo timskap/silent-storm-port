@@ -83,6 +83,12 @@ FPS while a lock screen or screensaver owns focus is not a gameplay measurement.
 Check camera movement, unpaused play, and background/return as well as a still
 frame. A passing shader test does not establish correctness of the whole scene.
 
+Camera controls: drag with two fingers to pan, pinch to zoom, and twist the
+same two fingers to rotate; the motions can be combined. Three-finger drag
+rotates and tilts. A two-finger tap is right click. Camera motion is smoothed,
+with lower sensitivity and proportional zoom. Character heads currently use
+their neutral pose; facial animation and lip sync are not implemented.
+
 Compact, cached draw buffers are enabled by default. For driver diagnosis,
 `A5_D3D_BUFFER_STREAM=0` selects the original buffer-upload path, while
 `A5_D3D_BUFFER_MAP=1` selects experimental mapped uploads when STREAM is unset.
