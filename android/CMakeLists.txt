@@ -17,6 +17,13 @@ project(silentstorm CXX C)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CTest)
+if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(silentstorm_frame_schedule_test tools/frame_schedule_test.cpp)
+    target_compile_options(silentstorm_frame_schedule_test PRIVATE -UNDEBUG)
+    add_test(NAME frame_schedule COMMAND silentstorm_frame_schedule_test)
+endif()
+
 #  ENGINE_GEN may be overridden (-DENGINE_GEN=... / A5_GEN_DIR for build.sh) so
 #  a session that re-stages does not pull the sources out from under another
 #  session's running build in the shared gen/.
@@ -271,6 +278,17 @@ endif()
 if(NOT ANDROID)
     #  Host build: the same boot harness without Android, so engine behaviour can
     #  be debugged on the development machine.  See docs/PORTING.md.
+    if(BUILD_TESTING)
+        add_executable(silentstorm_bsp_cache_test
+            tools/bsp_cache_test.cpp
+            ${ENGINE_GEN}/Main/BSPTree.cpp
+            ${ENGINE_GEN}/Main/aiObject.cpp)
+        target_include_directories(silentstorm_bsp_cache_test PRIVATE ${ENGINE_GEN} ${COMPAT_DIR}/d3d9gles)
+        target_compile_options(silentstorm_bsp_cache_test PRIVATE ${ENGINE_COMPILE_OPTIONS})
+        target_compile_definitions(silentstorm_bsp_cache_test PRIVATE ${ENGINE_DEFINITIONS})
+        target_link_libraries(silentstorm_bsp_cache_test PRIVATE a5fileio)
+        add_test(NAME bsp_cache COMMAND silentstorm_bsp_cache_test)
+    endif()
     add_executable(silentstorm_hosttest
         ${PLATFORM_DIR}/host_main.cpp
         ${PLATFORM_DIR}/boot_harness.cpp
@@ -294,9 +312,22 @@ if(NOT ANDROID)
 endif()
 
 #  native_app_glue ships with the NDK itself, so the APK can be assembled with
-#  nothing but the SDK build-tools (no Gradle/prefab dependency).
-add_library(native_app_glue STATIC
-    ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
+#  nothing but the SDK build-tools (no Gradle/prefab dependency). Switch the
+#  input queue BEFORE glue acknowledges the change to Android's UI thread.
+#  Reattaching in onAppCmd is too late: Android may already destroy the old
+#  queue while the input worker still uses it. Keep the SDK itself untouched.
+file(READ ${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c A5_GLUE)
+set(A5_GLUE_INPUT "if (android_app->inputQueue != NULL) {\n                LOGV(\"Attaching input queue to looper\");")
+string(FIND "${A5_GLUE}" "${A5_GLUE_INPUT}" A5_GLUE_INPUT_POS)
+if(A5_GLUE_INPUT_POS EQUAL -1)
+    message(FATAL_ERROR "NDK native_app_glue input hook changed; review the queue lifetime patch")
+endif()
+string(REPLACE "${A5_GLUE_INPUT}"
+    "if (!a5_android_switch_input_queue(android_app, android_app->inputQueue) && android_app->inputQueue != NULL) {\n                LOGV(\"Attaching input queue to looper\");"
+    A5_GLUE "${A5_GLUE}")
+set(A5_GLUE "struct android_app;\nstruct AInputQueue;\nextern int a5_android_switch_input_queue(struct android_app *, struct AInputQueue *);\n${A5_GLUE}")
+file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/android_native_app_glue.c CONTENT "${A5_GLUE}" @ONLY)
+add_library(native_app_glue STATIC ${CMAKE_CURRENT_BINARY_DIR}/android_native_app_glue.c)
 target_include_directories(native_app_glue PUBLIC
     ${ANDROID_NDK}/sources/android/native_app_glue)
 

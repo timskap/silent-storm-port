@@ -510,6 +510,7 @@ struct A5D3DFrameStats
     int nClears;
     int nGLErrors;
     int nPresents;         /* never reset: frames since device creation */
+    uint64_t nBufferUploadBytes;
 };
 void A5D3DGetFrameStats( A5D3DFrameStats *pOut, int bReset );
 /*  "vs+ps:count ..." for the draws since the last reset (top 12); the first

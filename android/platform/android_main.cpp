@@ -12,6 +12,12 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <android/log.h>
+#include <android/choreographer.h>
+#include <atomic>
+#include <deque>
+#include <set>
+#include <algorithm>
+#include <errno.h>
 #include <android/window.h>
 #include <jni.h>
 #include <math.h>
@@ -28,6 +34,7 @@
 #include "windows.h"
 #include "d3d9.h"
 #include "a5_input.h"
+#include "frame_schedule.h"
 #ifdef A5_HAVE_MAIN
 #include "game_entry.h"
 #endif
@@ -62,10 +69,19 @@ struct SEngineState
     ERunMode     mode        = RUN_CONSOLE;
     bool         bGameRunning = false;
     bool         bSurfaceAlive = false;
+    bool         bResumed = false;
+    bool         bFocused = false;
+    bool         bFramePosted = false;
+    bool         bFrameReady = false;
+    bool         bResetTiming = true;
+    AChoreographer *pChoreographer = 0;
+    CFrameSchedule frameSchedule;
 
     EGLDisplay display       = EGL_NO_DISPLAY;
     EGLSurface surface       = EGL_NO_SURFACE;
     EGLContext context       = EGL_NO_CONTEXT;
+    EGLConfig  config        = 0;
+    EGLSurface parkingSurface = EGL_NO_SURFACE;
     int        nWidth        = 0;
     int        nHeight       = 0;
 
@@ -222,91 +238,128 @@ SEngineState *g_pState = 0;
 int  HookWindowWidth()  { return g_pState ? g_pState->nWidth : 0; }
 int  HookWindowHeight() { return g_pState ? g_pState->nHeight : 0; }
 static int g_nPresents = 0;
+double NowSeconds();
+static double g_fSwapSeconds = 0;
 void HookPresent()
 {
-    ++g_nPresents;
-    if ( g_pState && g_pState->display != EGL_NO_DISPLAY )
-        eglSwapBuffers( g_pState->display, g_pState->surface );
+    if ( !g_pState || !g_pState->bSurfaceAlive ) return;
+    const double start = NowSeconds();
+    if ( !eglSwapBuffers( g_pState->display, g_pState->surface ) )
+    {
+        LOGE( "eglSwapBuffers failed: 0x%x", eglGetError() );
+        g_pState->bSurfaceAlive = false;
+    }
+    else
+        ++g_nPresents;
+    g_fSwapSeconds += NowSeconds() - start;
 }
-int  HookSurfaceAlive() { return g_pState && g_pState->bSurfaceAlive ? 1 : 0; }
+int HookSurfaceAlive() { return g_pState && g_pState->bSurfaceAlive ? 1 : 0; }
+
+// Window surfaces can disappear on lock, backgrounding, rotation or folding.
+// Keep the context current on a tiny pbuffer so all engine GL objects survive.
+void TerminateDisplay( SEngineState *pState, bool bShutdown = false )
+{
+    pState->bSurfaceAlive = false;
+    pState->bFrameReady = false;
+    pState->frameSchedule.Reset();
+    pState->bResetTiming = true;
+    if ( pState->display == EGL_NO_DISPLAY ) return;
+    eglMakeCurrent( pState->display, pState->parkingSurface,
+                    pState->parkingSurface, pState->context );
+    if ( pState->surface != EGL_NO_SURFACE )
+        eglDestroySurface( pState->display, pState->surface );
+    pState->surface = EGL_NO_SURFACE;
+    if ( !bShutdown ) return;
+    pState->console.Shutdown();
+    eglMakeCurrent( pState->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT );
+    if ( pState->context != EGL_NO_CONTEXT ) eglDestroyContext( pState->display, pState->context );
+    if ( pState->parkingSurface != EGL_NO_SURFACE ) eglDestroySurface( pState->display, pState->parkingSurface );
+    eglTerminate( pState->display );
+    pState->display = EGL_NO_DISPLAY;
+    pState->context = EGL_NO_CONTEXT;
+    pState->parkingSurface = EGL_NO_SURFACE;
+}
 
 bool InitDisplay( SEngineState *pState )
 {
-    const EGLint attributes[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_BLUE_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_RED_SIZE, 8,
-        EGL_DEPTH_SIZE, 16,
-        EGL_NONE
-    };
-
-    EGLDisplay display = eglGetDisplay( EGL_DEFAULT_DISPLAY );
-    eglInitialize( display, 0, 0 );
-
-    EGLConfig config;
-    EGLint    nConfigs = 0;
-    if ( !eglChooseConfig( display, attributes, &config, 1, &nConfigs ) || nConfigs < 1 )
+    const bool reuse = pState->context != EGL_NO_CONTEXT;
+    if ( !reuse )
     {
-        LOGE( "eglChooseConfig found no ES2 config" );
+        const EGLint attributes[] = {
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+            EGL_BLUE_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_RED_SIZE, 8,
+            EGL_NONE
+        };
+        pState->display = eglGetDisplay( EGL_DEFAULT_DISPLAY );
+        EGLint count = 0;
+        if ( !eglInitialize( pState->display, 0, 0 ) ||
+             !eglChooseConfig( pState->display, attributes, &pState->config, 1, &count ) || !count )
+        {
+            LOGE( "EGL: no GLES 3 config (0x%x)", eglGetError() );
+            TerminateDisplay( pState, true );
+            return false;
+        }
+        const EGLint contextAttrs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+        const EGLint pbufferAttrs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+        pState->context = eglCreateContext( pState->display, pState->config, EGL_NO_CONTEXT, contextAttrs );
+        pState->parkingSurface = eglCreatePbufferSurface( pState->display, pState->config, pbufferAttrs );
+        if ( pState->context == EGL_NO_CONTEXT || pState->parkingSurface == EGL_NO_SURFACE )
+        {
+            LOGE( "EGL: context/pbuffer creation failed (0x%x)", eglGetError() );
+            TerminateDisplay( pState, true );
+            return false;
+        }
+    }
+    EGLint format = 0;
+    eglGetConfigAttrib( pState->display, pState->config, EGL_NATIVE_VISUAL_ID, &format );
+    ANativeWindow_setBuffersGeometry( pState->pApp->window, 0, 0, format );
+    pState->surface = eglCreateWindowSurface( pState->display, pState->config, pState->pApp->window, 0 );
+    if ( pState->surface == EGL_NO_SURFACE ||
+         !eglMakeCurrent( pState->display, pState->surface, pState->surface, pState->context ) )
+    {
+        LOGE( "EGL: window activation failed (0x%x)", eglGetError() );
+        TerminateDisplay( pState );
         return false;
     }
-
-    /* ANativeWindow must use the format the chosen config expects. */
-    EGLint nFormat = 0;
-    eglGetConfigAttrib( display, config, EGL_NATIVE_VISUAL_ID, &nFormat );
-    ANativeWindow_setBuffersGeometry( pState->pApp->window, 0, 0, nFormat );
-
-    EGLSurface surface = eglCreateWindowSurface( display, config, pState->pApp->window, 0 );
-
-    const EGLint contextAttributes[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-    EGLContext context = eglCreateContext( display, config, EGL_NO_CONTEXT, contextAttributes );
-
-    if ( eglMakeCurrent( display, surface, surface, context ) == EGL_FALSE )
-    {
-        LOGE( "eglMakeCurrent failed" );
-        return false;
-    }
-
-    EGLint nWidth = 0, nHeight = 0;
-    eglQuerySurface( display, surface, EGL_WIDTH, &nWidth );
-    eglQuerySurface( display, surface, EGL_HEIGHT, &nHeight );
-
-    pState->display = display;
-    pState->surface = surface;
-    pState->context = context;
-    pState->nWidth  = nWidth;
-    pState->nHeight = nHeight;
-
-    LOGI( "EGL surface %dx%d", nWidth, nHeight );
+    eglSwapInterval( pState->display, 1 );
+    EGLint width = 0, height = 0;
+    eglQuerySurface( pState->display, pState->surface, EGL_WIDTH, &width );
+    eglQuerySurface( pState->display, pState->surface, EGL_HEIGHT, &height );
+    pState->nWidth = width;
+    pState->nHeight = height;
     pState->bSurfaceAlive = true;
-
-    if ( !pState->console.Init() )
-        return false;
-    pState->console.SetViewport( nWidth, nHeight );
+    pState->frameSchedule.Reset();
+    pState->bResetTiming = true;
+    if ( !pState->console.IsReady() && !pState->console.Init() ) return false;
+    pState->console.SetViewport( width, height );
+    LOGI( "EGL surface %dx%d (%s context); target 30 fps", width, height, reuse ? "preserved" : "new GLES 3" );
     return true;
 }
 
-void TerminateDisplay( SEngineState *pState )
+bool CanRender( const SEngineState *s )
 {
-    pState->bSurfaceAlive = false;
-    pState->console.Shutdown();
-    if ( pState->display != EGL_NO_DISPLAY )
+    return s->mode == RUN_GAME && s->bGameRunning && s->bSurfaceAlive && s->bResumed && s->bFocused;
+}
+
+void FrameCallback( long frameTimeNanos, void *data )
+{
+    SEngineState *s = static_cast<SEngineState *>( data );
+    s->bFramePosted = false;
+    // API 24's callback uses a 32-bit long on armeabi-v7a. Reconstruct the
+    // recent timestamp relative to the monotonic clock across its wrap.
+    int64_t timestamp = frameTimeNanos;
+    if ( sizeof( long ) == 4 )
     {
-        eglMakeCurrent( pState->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT );
-        if ( pState->context != EGL_NO_CONTEXT )
-            eglDestroyContext( pState->display, pState->context );
-        if ( pState->surface != EGL_NO_SURFACE )
-            eglDestroySurface( pState->display, pState->surface );
-        eglTerminate( pState->display );
+        const int64_t now = (int64_t)( NowSeconds() * 1e9 );
+        timestamp = now - (uint32_t)( (uint32_t)now - (uint32_t)frameTimeNanos );
     }
-    pState->display = EGL_NO_DISPLAY;
-    pState->context = EGL_NO_CONTEXT;
-    pState->surface = EGL_NO_SURFACE;
+    s->bFrameReady = CanRender( s ) && s->frameSchedule.OnVsync( timestamp );
 }
 
 void DrawFrame( SEngineState *pState )
 {
-    if ( pState->display == EGL_NO_DISPLAY || !pState->console.IsReady() )
+    if ( pState->mode != RUN_CONSOLE || !pState->bSurfaceAlive || !pState->console.IsReady() )
         return;
     pState->console.Render( 0.0 );
     eglSwapBuffers( pState->display, pState->surface );
@@ -319,6 +372,60 @@ double NowSeconds()
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+// The input worker only copies Android events. Gesture interpretation, engine
+// calls and renderer coordinate conversion stay on the game thread.
+struct SQueuedInput
+{
+    int type = 0, action = 0, key = 0;
+    double time = 0;
+    struct Pointer { int id; float x, y; };
+    std::vector<Pointer> pointers;
+};
+size_t AMotionEvent_getPointerCount( const SQueuedInput *e ) { return e->pointers.size(); }
+int AMotionEvent_getPointerId( const SQueuedInput *e, size_t i ) { return e->pointers[i].id; }
+float AMotionEvent_getX( const SQueuedInput *e, size_t i ) { return e->pointers[i].x; }
+float AMotionEvent_getY( const SQueuedInput *e, size_t i ) { return e->pointers[i].y; }
+int AMotionEvent_getAction( const SQueuedInput *e ) { return e->action; }
+std::mutex g_inputMutex;
+std::deque<SQueuedInput> g_inputEvents;
+bool g_resetInput = false;
+std::set<int> g_heldKeys; // game thread only
+
+int32_t QueueInput( android_app *app, AInputEvent *event )
+{
+    SQueuedInput e;
+    e.type = AInputEvent_getType( event );
+    if ( e.type == AINPUT_EVENT_TYPE_MOTION )
+    {
+        e.action = ::AMotionEvent_getAction( event );
+        e.time = ::AMotionEvent_getEventTime( event ) * 1e-9;
+        for ( size_t i = 0; i < ::AMotionEvent_getPointerCount( event ); ++i )
+            e.pointers.push_back( { ::AMotionEvent_getPointerId( event, i ),
+                                   ::AMotionEvent_getX( event, i ), ::AMotionEvent_getY( event, i ) } );
+        if ( e.pointers.empty() ) return 0;
+    }
+    else if ( e.type == AINPUT_EVENT_TYPE_KEY )
+    {
+        e.action = AKeyEvent_getAction( event );
+        e.key = AKeyEvent_getKeyCode( event );
+        e.time = AKeyEvent_getEventTime( event ) * 1e-9;
+    }
+    else return 0;
+    {
+        std::lock_guard<std::mutex> lock( g_inputMutex );
+        // Bound memory during long loads; cancel held controls after overflow.
+        if ( g_inputEvents.size() >= 256 )
+        {
+            g_inputEvents.clear();
+            g_resetInput = true;
+        }
+        g_inputEvents.push_back( std::move( e ) );
+    }
+    ALooper_wake( app->looper );
+    return 1;
+}
+
+#ifdef A5_HAVE_MAIN
 /*  Gesture tuning.  The slop and the pinch step scale with the window so the
  *  gestures feel the same across screen densities. */
 const double F_PRESS_DELAY = 0.09;       /* seconds a left press is held back */
@@ -365,7 +472,7 @@ void FlushPendingPress( SEngineState *pState )
  *  movement of the midpoint, rotate by the turn of the finger line (twist) or
  *  by the midpoint drag when a third finger is down (orbit).  Nothing is fed
  *  until the movement decides the mode, so a two-finger tap stays a tap. */
-void UpdateGesture( SEngineState *pState, AInputEvent *pEvent )
+void UpdateGesture( SEngineState *pState, const SQueuedInput *pEvent )
 {
     const size_t nPointers = AMotionEvent_getPointerCount( pEvent );
     float fX0 = 0, fY0 = 0, fX1 = 0, fY1 = 0;
@@ -513,7 +620,7 @@ void EndGesture( SEngineState *pState, bool bAllowTap )
     pState->eGestureMode = GM_UNDECIDED;
 }
 
-int32_t HandleGameTouch( SEngineState *pState, AInputEvent *pEvent, int32_t nAction )
+int32_t HandleGameTouch( SEngineState *pState, const SQueuedInput *pEvent, int32_t nAction )
 {
     const float fX = AMotionEvent_getX( pEvent, 0 );
     const float fY = AMotionEvent_getY( pEvent, 0 );
@@ -529,7 +636,7 @@ int32_t HandleGameTouch( SEngineState *pState, AInputEvent *pEvent, int32_t nAct
                 a5_set_pointer_position( (long)fBackX, (long)fBackY );
             pState->bPressPending = pState->bPressInside;
             pState->bPressSent    = false;
-            pState->fPressTime    = NowSeconds();
+            pState->fPressTime    = pEvent->time;
             pState->fPressX = fX;
             pState->fPressY = fY;
             break;
@@ -588,7 +695,7 @@ int32_t HandleGameTouch( SEngineState *pState, AInputEvent *pEvent, int32_t nAct
             }
             if ( pState->bPressPending &&
                  ( hypotf( fX - pState->fPressX, fY - pState->fPressY ) > GestureSlop( pState ) ||
-                   NowSeconds() - pState->fPressTime > F_PRESS_DELAY ) )
+                   pEvent->time - pState->fPressTime > F_PRESS_DELAY ) )
                 FlushPendingPress( pState );   /* a drag or a hold, not a nascent gesture */
             {
                 float fBackX = 0, fBackY = 0;
@@ -648,35 +755,38 @@ int32_t HandleGameTouch( SEngineState *pState, AInputEvent *pEvent, int32_t nAct
     return 1;
 }
 
-/*  Runs on the input thread (see StartInputThread); the game loop reads the
- *  touch state machine under the same mutex. */
-std::mutex g_inputMutex;
+#endif // A5_HAVE_MAIN
 
-int32_t HandleInput( android_app *pApp, AInputEvent *pEvent )
+int32_t HandleInput( android_app *pApp, const SQueuedInput *pEvent )
 {
-    std::lock_guard< std::mutex > lock( g_inputMutex );
     SEngineState *pState = (SEngineState *)pApp->userData;
-    if ( AInputEvent_getType( pEvent ) == AINPUT_EVENT_TYPE_KEY )
+    if ( pEvent->type == AINPUT_EVENT_TYPE_KEY )
     {
-        const int32_t nKeyAction = AKeyEvent_getAction( pEvent );
-        const int32_t nKey = AKeyEvent_getKeyCode( pEvent );
+#ifdef A5_HAVE_MAIN
+        const int32_t nKeyAction = pEvent->action;
+        const int32_t nKey = pEvent->key;
         if ( pState->mode == RUN_GAME && ( nKeyAction == AKEY_EVENT_ACTION_DOWN || nKeyAction == AKEY_EVENT_ACTION_UP ) )
         {
+            if ( nKeyAction == AKEY_EVENT_ACTION_DOWN ) g_heldKeys.insert( nKey );
+            else g_heldKeys.erase( nKey );
             /* Back is the game's Escape */
             a5_input_key( nKey == AKEYCODE_BACK ? AKEYCODE_ESCAPE : nKey, nKeyAction == AKEY_EVENT_ACTION_DOWN );
             return 1;
         }
+#endif
         return 0;
     }
-    if ( AInputEvent_getType( pEvent ) != AINPUT_EVENT_TYPE_MOTION )
+    if ( pEvent->type != AINPUT_EVENT_TYPE_MOTION )
         return 0;
 
     const int32_t nAction = AMotionEvent_getAction( pEvent ) & AMOTION_EVENT_ACTION_MASK;
     const float   fX      = AMotionEvent_getX( pEvent, 0 );
     const float   fY      = AMotionEvent_getY( pEvent, 0 );
 
+#ifdef A5_HAVE_MAIN
     if ( pState->mode == RUN_GAME )
         return HandleGameTouch( pState, pEvent, nAction );
+#endif
 
     switch ( nAction )
     {
@@ -699,56 +809,96 @@ int32_t HandleInput( android_app *pApp, AInputEvent *pEvent )
     return 0;
 }
 
-/* ---- input thread --------------------------------------------------------
- *  native_app_glue attaches the AInputQueue to the game thread's looper, so a
- *  long engine call (mission generation, a pass-calc job) leaves touches
- *  unconsumed and after 10s Android declares the app unresponsive ("Input
- *  dispatching timed out" ANR).  The queue is re-attached to this thread
- *  instead (HandleCommand, APP_CMD_INPUT_CHANGED): events are consumed and
- *  queued for the engine immediately, whatever the game thread is doing. */
+void ResetInput( SEngineState *s )
+{
+#ifdef A5_HAVE_MAIN
+    EndGesture( s, false );
+    s->bPressPending = false;
+    if ( s->bPressSent ) a5_input_mouse_button( 0, 0 );
+    s->bPressSent = s->bPressInside = s->bTouching = false;
+    s->nTouchCount = 0;
+    for ( int key : g_heldKeys ) a5_input_key( key == AKEYCODE_BACK ? AKEYCODE_ESCAPE : key, 0 );
+    g_heldKeys.clear();
+#endif
+    s->bTouching = false;
+}
+void DrainInput( SEngineState *s )
+{
+    std::deque<SQueuedInput> events;
+    bool reset;
+    {
+        std::lock_guard<std::mutex> lock( g_inputMutex );
+        events.swap( g_inputEvents );
+        reset = g_resetInput;
+        g_resetInput = false;
+    }
+    if ( reset ) ResetInput( s );
+    const double now = NowSeconds();
+    for ( const SQueuedInput &e : events )
+    {
+        // Do not replay taps made on a loading screen into the loaded mission.
+        if ( now - e.time > 0.5 || !s->bResumed || !s->bFocused ) ResetInput( s );
+        else HandleInput( s->pApp, &e );
+    }
+}
+
+/* ---- input thread: acknowledge promptly, even during world generation ---- */
 ALooper *g_pInputLooper = 0;
-sem_t    g_inputLooperReady;
+sem_t g_inputLooperReady;
+pthread_t g_inputThread;
+std::atomic<bool> g_stopInput( false );
+std::mutex g_inputQueueMutex;
+AInputQueue *g_inputQueue = 0;
 
 int InputQueueCallback( int, int, void *pData )
 {
-    android_app *pApp   = (android_app *)pData;
-    AInputQueue *pQueue = pApp->inputQueue;
-    if ( !pQueue )
-        return 1;
-    AInputEvent *pEvent = 0;
-    while ( AInputQueue_getEvent( pQueue, &pEvent ) >= 0 )
+    android_app *app = static_cast<android_app *>( pData );
+    std::lock_guard<std::mutex> lock( g_inputQueueMutex );
+    if ( !g_inputQueue ) return 1;
+    AInputEvent *event = 0;
+    while ( AInputQueue_getEvent( g_inputQueue, &event ) >= 0 )
     {
-        if ( AInputQueue_preDispatchEvent( pQueue, pEvent ) )
-            continue;   /* the IME took it */
-        const int32_t nHandled = HandleInput( pApp, pEvent );
-        AInputQueue_finishEvent( pQueue, pEvent, nHandled );
+        if ( AInputQueue_preDispatchEvent( g_inputQueue, event ) ) continue;
+        const int handled = QueueInput( app, event );
+        AInputQueue_finishEvent( g_inputQueue, event, handled );
     }
-    /*  When the console is idle the game loop blocks in its looper; wake it
-     *  so a touch scrolls the console without waiting for another command. */
-    ALooper_wake( pApp->looper );
-    return 1;   /* keep the callback installed */
+    return 1;
 }
-
 void *InputThreadMain( void * )
 {
     g_pInputLooper = ALooper_prepare( ALOOPER_PREPARE_ALLOW_NON_CALLBACKS );
+    ALooper_acquire( g_pInputLooper );
     sem_post( &g_inputLooperReady );
-    for ( ;; )
-        ALooper_pollOnce( -1, 0, 0, 0 );   /* callbacks dispatch inside */
+    while ( !g_stopInput.load() ) ALooper_pollOnce( -1, 0, 0, 0 );
+    ALooper_release( g_pInputLooper );
     return 0;
 }
-
 void StartInputThread()
 {
+    g_stopInput = false;
     sem_init( &g_inputLooperReady, 0, 0 );
-    pthread_t thread;
-    if ( pthread_create( &thread, 0, InputThreadMain, 0 ) != 0 )
+    if ( pthread_create( &g_inputThread, 0, InputThreadMain, 0 ) != 0 )
     {
-        LOGE( "input: thread failed to start - input stays on the game thread" );
-        return;   /* g_pInputLooper stays 0; the glue's path keeps working */
+        LOGE( "input: thread failed to start - using game thread" );
+        sem_destroy( &g_inputLooperReady );
+        return;
     }
-    pthread_detach( thread );
-    sem_wait( &g_inputLooperReady );
+    while ( sem_wait( &g_inputLooperReady ) != 0 && errno == EINTR ) {}
+    sem_destroy( &g_inputLooperReady );
+    LOGI( "input: worker ready" );
+}
+void StopInputThread()
+{
+    if ( !g_pInputLooper ) return;
+    {
+        std::lock_guard<std::mutex> lock( g_inputQueueMutex );
+        if ( g_inputQueue ) AInputQueue_detachLooper( g_inputQueue );
+        g_inputQueue = 0;
+    }
+    g_stopInput = true;
+    ALooper_wake( g_pInputLooper );
+    pthread_join( g_inputThread, 0 );
+    g_pInputLooper = 0;
 }
 
 void StartGameIfPossible( SEngineState *pState )
@@ -818,7 +968,7 @@ void HandleCommand( android_app *pApp, int32_t nCommand )
 
         case APP_CMD_WINDOW_RESIZED:
         case APP_CMD_CONFIG_CHANGED:
-            if ( pState->display != EGL_NO_DISPLAY )
+            if ( pState->bSurfaceAlive )
             {
                 EGLint nWidth = 0, nHeight = 0;
                 eglQuerySurface( pState->display, pState->surface, EGL_WIDTH, &nWidth );
@@ -830,30 +980,37 @@ void HandleCommand( android_app *pApp, int32_t nCommand )
             break;
 
         case APP_CMD_GAINED_FOCUS:
+            pState->bFocused = true;
+            pState->frameSchedule.Reset();
+            pState->bResetTiming = true;
+            break;
         case APP_CMD_LOST_FOCUS:
+            ResetInput( pState );
+            pState->bFocused = false;
+            pState->bFrameReady = false;
             break;
 
-        /*  The glue has just attached the (new) queue to this thread's looper;
-         *  move it to the input thread so touches are consumed even while the
-         *  engine holds this thread (see the input-thread comment). */
+        // The queue has already been switched under glue's lifecycle mutex.
         case APP_CMD_INPUT_CHANGED:
-            if ( pApp->inputQueue && g_pInputLooper )
-            {
-                AInputQueue_detachLooper( pApp->inputQueue );
-                AInputQueue_attachLooper( pApp->inputQueue, g_pInputLooper,
-                                          0, InputQueueCallback, pApp );
-            }
+            ResetInput( pState );
             break;
 
         /* Background: silence the mixer's output stream (nothing advances while
          * we are away, so sounds resume where they were). */
         case APP_CMD_PAUSE:
         case APP_CMD_STOP:
+            pState->bResumed = false;
+            pState->bFrameReady = false;
+            pState->frameSchedule.Reset();
+            pState->bResetTiming = true;
 #ifdef A5_HAVE_AUDIO
             a5_audio_set_active( 0 );
 #endif
             break;
         case APP_CMD_RESUME:
+            pState->bResumed = true;
+            pState->frameSchedule.Reset();
+            pState->bResetTiming = true;
 #ifdef A5_HAVE_AUDIO
             a5_audio_set_active( 1 );
 #endif
@@ -862,6 +1019,18 @@ void HandleCommand( android_app *pApp, int32_t nCommand )
 }
 
 }  // namespace
+
+// Called by the staged NDK glue before it wakes the UI thread that owns the
+// queue. The old queue cannot be destroyed until this lock has joined any
+// in-flight callback; the worker never reads app->inputQueue itself.
+extern "C" int a5_android_switch_input_queue( android_app *app, AInputQueue *queue )
+{
+    if ( !g_pInputLooper ) return 0; // thread startup failed: use glue's fallback
+    std::lock_guard<std::mutex> lock( g_inputQueueMutex );
+    g_inputQueue = queue;
+    if ( queue ) AInputQueue_attachLooper( queue, g_pInputLooper, 0, InputQueueCallback, app );
+    return 1;
+}
 
 void android_main( android_app *pApp )
 {
@@ -872,11 +1041,12 @@ void android_main( android_app *pApp )
 
     pApp->userData     = &state;
     pApp->onAppCmd     = HandleCommand;
-    pApp->onInputEvent = HandleInput;
+    pApp->onInputEvent = QueueInput;
+    StartInputThread();
 
     /*  Fullscreen, like the original game.  Without this the status bar sits on
      *  top of the surface and overlaps the first lines of output. */
-    ANativeActivity_setWindowFlags( pApp->activity, AWINDOW_FLAG_FULLSCREEN, 0 );
+    ANativeActivity_setWindowFlags( pApp->activity, AWINDOW_FLAG_FULLSCREEN | AWINDOW_FLAG_KEEP_SCREEN_ON, 0 );
 
     state.szExternalFilesDir = GetActivityDirectory( pApp, "getExternalFilesDir", true );
     state.szInternalFilesDir = GetActivityDirectory( pApp, "getFilesDir", false );
@@ -900,34 +1070,43 @@ void android_main( android_app *pApp )
     }
     LOGI( "internal files dir: %s", state.szInternalFilesDir.c_str() );
 
+    state.pChoreographer = AChoreographer_getInstance();
     while ( true )
     {
+        if ( CanRender( &state ) && !state.bFramePosted )
+        {
+            state.bFramePosted = true;
+            AChoreographer_postFrameCallback( state.pChoreographer, FrameCallback, &state );
+        }
         int                  nEvents;
         android_poll_source *pSource;
 
-        /* Console: block when idle (it is static).  Game: poll and step. */
-        const int nTimeout = state.mode == RUN_GAME && state.bSurfaceAlive ? 0 : -1;
+        /* Both modes sleep in the looper; only selected vsyncs step the game. */
+        const int nTimeout = state.bFrameReady ? 0 : -1;
         while ( ALooper_pollOnce( nTimeout, 0, &nEvents, (void **)&pSource ) >= 0 )
         {
             if ( pSource )
                 pSource->process( pApp, pSource );
             if ( pApp->destroyRequested )
             {
+                StopInputThread();
 #ifdef A5_HAVE_MAIN
                 if ( state.bGameRunning )
                     a5_game_shutdown();
 #endif
-                TerminateDisplay( &state );
+                TerminateDisplay( &state, true );
                 return;
             }
             if ( state.bTouching || state.mode == RUN_GAME )
                 break;
         }
+        DrainInput( &state );
         if ( state.mode == RUN_GAME )
         {
 #ifdef A5_HAVE_MAIN
-            if ( state.bSurfaceAlive && state.bGameRunning )
+            if ( CanRender( &state ) && state.bFrameReady )
             {
+                state.bFrameReady = false;
                 /*  A stationary finger sends no MOVE events, so the held-back
                  *  left press (see SEngineState) is aged out here: after the
                  *  delay a press-and-hold reaches the engine as one. */
@@ -941,27 +1120,53 @@ void android_main( android_app *pApp )
                     state.bKeyboardShown = bWantKeyboard;
                     ShowSoftKeyboard( pApp, bWantKeyboard );
                 }
-                static int nSteps = 0;
-                static double fLastLog = 0;
-                ++nSteps;
+                static double lastFrame = 0, lastLog = 0;
+                static std::vector<double> intervals;
+                static double workSum = 0, workMax = 0, swapSum = 0;
+                static int samples = 0;
+                const double start = NowSeconds();
+                if ( state.bResetTiming )
                 {
-                    struct timespec ts; clock_gettime( CLOCK_MONOTONIC, &ts );
-                    const double fNow = ts.tv_sec + ts.tv_nsec * 1e-9;
-                    if ( fNow - fLastLog > 5.0 )
-                    {
-                        fLastLog = fNow;
-                        A5D3DFrameStats st;
-                        A5D3DGetFrameStats( &st, 1 );
-                        LOGI( "game: %d steps, %d presents, interface depth %d; since last: %d draws (%d without program), %d clears",
-                              nSteps, g_nPresents, a5_game_interface_depth(), st.nDraws, st.nDrawsNoProgram, st.nClears );
-                        if ( getenv( "A5_D3D_SHADERS" ) )
-                            LOGI( "game: draws by shader: %s", A5D3DDrawsByShader( 1 ) );
-#ifdef A5_HAVE_AUDIO
-                        a5_audio_log_stats();
-#endif
-                    }
+                    state.bResetTiming = false;
+                    lastFrame = lastLog = 0;
+                    intervals.clear();
+                    workSum = workMax = swapSum = 0;
+                    samples = 0;
                 }
-                if ( !a5_game_step( 1 ) )
+                if ( lastFrame ) intervals.push_back( ( start - lastFrame ) * 1000.0 );
+                lastFrame = start;
+                if ( !lastLog ) lastLog = start;
+                g_fSwapSeconds = 0;
+                const int running = a5_game_step( 1 );
+                const double work = NowSeconds() - start - g_fSwapSeconds;
+                workSum += work;
+                workMax = ( workMax > work ? workMax : work );
+                swapSum += g_fSwapSeconds;
+                ++samples;
+                if ( start - lastLog >= 5.0 )
+                {
+                    std::sort( intervals.begin(), intervals.end() );
+                    double total = 0;
+                    for ( double ms : intervals ) total += ms;
+                    const double p95 = intervals.empty() ? 0 : intervals[( intervals.size() - 1 ) * 95 / 100];
+                    const double maxMs = intervals.empty() ? 0 : intervals.back();
+                    A5D3DFrameStats st;
+                    A5D3DGetFrameStats( &st, 1 );
+                    LOGI( "perf: %.1f fps, frame p95 %.2f max %.2f ms; work avg %.2f max %.2f ms, swap avg %.2f ms; %d draws, %d skipped, %d GL errors, %d presents; upload %.2f MiB/frame",
+                          total ? intervals.size() * 1000.0 / total : 0, p95, maxMs,
+                          workSum * 1000 / samples, workMax * 1000, swapSum * 1000 / samples,
+                          st.nDraws, st.nDrawsNoProgram, st.nGLErrors, g_nPresents,
+                          (double)st.nBufferUploadBytes / ( samples * 1048576.0 ) );
+                    if ( getenv( "A5_D3D_SHADERS" ) ) LOGI( "game: draws by shader: %s", A5D3DDrawsByShader( 1 ) );
+#ifdef A5_HAVE_AUDIO
+                    a5_audio_log_stats();
+#endif
+                    intervals.clear();
+                    samples = 0;
+                    workSum = workMax = swapSum = 0;
+                    lastLog = start;
+                }
+                if ( !running )
                 {
                     LOGI( "game: asked to exit" );
                     a5_game_shutdown();

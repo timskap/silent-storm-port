@@ -117,6 +117,104 @@ Still open here: the retail scripts hit one `nil` function this snapshot's
 script API lacks, and the tactical HUD draws a blue checkerboard where
 `Textures/615` should be — that file is absent from the retail data.
 
+**Mission frame rate and the loading screen (2026-08-25, rule sets 21/22).**
+Both were places where this snapshot predates retail behaviour, and both fixes
+were decoded from the retail Game.exe by the [Silent-Storm-Reconstruction
+project](https://github.com/met-nikita/Silent-Storm-Reconstruction) (RVAs are
+cited in the rules and in-code):
+
+* **The HUD rebuilt the 3D portraits from scratch every frame.** Every
+  `CUnitFace` — the big selected-unit face and the up-to-six party faces —
+  called `CUnitView::SetUnit` from its panel's `Draw`, and that calls
+  `NRender::CreateShowUnit`, a complete render clone of the unit (body model,
+  uniform, head, animator). Seven full unit builds per frame. Retail
+  `CUnitFace::SetUnit` (@0x254c80) is a no-op while the tracked unit is
+  unchanged — rule set 21 does the same (and also compares the world unit, so
+  a unit swapped under its tracker — entering a Panzerklein — still rebinds).
+  The Panzerklein cannon slot had the same shape of bug: `CShowItemModel::Set`
+  (a full `CreateModel` + a `new CToolTip`) per frame; retail keeps a
+  weapon-in-hand cache (@0x256160).
+* **Camera movement switched occlusion culling off.** `UpdateIgnoreMark`
+  dropped the hidden-parts list on *any* camera motion and only rebuilt it
+  after three still frames — so precisely while the player pans or zooms (on a
+  touch screen: most of the time) the scene drew with no HSR at all. Retail's
+  default mode (`gfx_hsr 2` = `HSR_DYNAMIC`, @0x160780) keeps the list alive
+  while the camera moves and refreshes it every 2nd frame with a persistent
+  400×300 rasteriser (`MakeInvisibleElementsListFast`, @0x1770f0); the
+  full-resolution pass also gets retail's [4,400]×[4,300] clamp (@0x176d50).
+  The whole retail mode is ported (enum value, `gfx_hsr` mapping and default,
+  the fast pass, the mode-aware `UpdateIgnoreMark`).
+* **A mission load was a black screen.** The snapshot's `ShowLogo()` draws one
+  static frame of texture 1744 — absent from the retail data — and nothing
+  else until the mission's first real frame. Retail's loading screen
+  (`iLoading.obj`: `CLoadingUI` on UI container 419 — full-screen `background`
+  splash, default UITexture 883, a bottom-right `video` box that played
+  `loading.bik`, two template-drawn text lines — plus
+  `ShowLoadingScreen(percent)` checkpoints) is recreated in `iMain.cpp` on
+  this snapshot's own UI classes. Bink is not licensed here, so the video box
+  holds a plain colour-fill progress bar. Checkpoints at 0 (with the zone's
+  `PWLImageID` splash — the column is imported now, though every zone in the
+  Steam `Complete/` data has it 0), 25, 50, 75, 100 in
+  `CICBeginMission::Exec`/`CMission::Initialize`; `TermLoadingScreen` pairs
+  with `DoneInterface`. The interface is built lazily on first use and kept
+  for later loads. Note the 25→50 band (world generation) is the long one and
+  the bar sits still inside it — the retail smooth counter that ticked inside
+  world creation is not wired.
+
+On-device state of this work (Z Fold7, 2026-08-25 evening): the build boots
+(45/45 harness checks — container 419 is now one of them), `template 4414`
+loads, and during the ~50 s load the loop presents frames again (the loading
+screen's throttled flips — 4 presents in the last 5 s window of the load, 93
+`vsRender2D` draws). What stopped the session was not the load but what comes
+*after* it: once the mission is up, the engine spends **minutes at 100% CPU on
+the game thread building collision BSP trees** (`Created BSP tree ...` flood —
+the AI pass calcer / physics working through the map), presenting nothing.
+A touch during that grind raised `Input dispatching timed out (Waited 10000ms
+for MotionEvent)` **despite the input thread** — three ANRs and the system
+killed the app before a steady-state FPS number could be read. So the
+remaining mission-FPS work is this grind, not the render loop: (a) find out
+why a MotionEvent still waits on the app (the input-thread reattach may be
+losing to a queue created while the game thread is busy), and (b) time-slice
+or background the pass-calc jobs (`aiPassCalcJob.cpp`) the way retail's
+`PassCalcerIsActive` script polling implies they were. The per-frame fixes
+above (portraits, HSR) apply to the loop that runs once the grind is over.
+
+**Android 30 FPS work (2026-10-06, rule set 23).** On the connected Galaxy Z
+Fold7 (Android 16, Adreno 830), `simpleperf` identified repeated BSP construction
+as the loading/pass-calculation bottleneck. Clang with `-fms-extensions` honours
+the old `#pragma optimize("", off)` switches: the supposedly optimised build
+contained `optnone` BSP routines. Rule set 23 removes those switches and builds
+missing BSPs once per static/memory geometry revision, retaining stored trees.
+Skinned poses and the specialised terrain builder are unchanged. In the same
+`template 4414` test, the long loading step fell from 47.8 s to 5.1 s.
+
+The loop now selects vsyncs for a 30 FPS target, blocks while inactive, and logs
+actual frame intervals. GLES 3 is requested explicitly. A pbuffer preserves the
+context when the window is replaced, and the console no longer draws over a
+running game's GL state. True GPU context loss still needs a separate recovery
+path. The input worker is now started, acknowledges Android events promptly,
+and queues copies for the game thread. A staged native-app-glue hook switches
+queues before Android can destroy the old queue; it does not patch the SDK.
+
+**Renderer optimisation is still under validation.** After the BSP fix the
+paused mission was approximately 3.6–4 FPS: Adreno spent most of the frame in
+full-buffer copies/allocation for small HUD updates. Mapped range uploads reached
+about 30 FPS, but early variants corrupted the scene despite passing small
+shader tests. They are not an accepted gameplay result. The current candidate
+tracks referenced vertex/index ranges, conservatively retains outstanding
+regions after a partial synchronized map, and validates index bounds. It is
+opt-in with `A5_D3D_BUFFER_MAP=1` in `env.txt`; the default retains the original
+upload path until the mission passes a sustained visual/input/resume check.
+Do not remove the opt-in gate based solely on FPS or the boot harness.
+
+The expanded device harness passes 48 checks (including appends to a 16 MiB
+vertex pool, overlapping updates, and missing-program rejection), with two
+existing data/UI warnings. Host checks pass (38 checks plus CTest's frame
+schedule and BSP-cache regressions). ARM64 full-game and ARMv7 harness builds
+compile. Final scene validation of the latest candidate was interrupted when
+Android returned to the PIN screen; unpaused gameplay and background/return
+remain to be checked on the unlocked device.
+
 Three bugs found on the way that were invisible before and affect *everything*
 (details in Traps): DB cross-references imported from a file where the target
 class was only forward-declared were all null (Itanium `typeid(T*)` for an
@@ -470,9 +568,9 @@ and is the port's regression test. It runs in two places from the same source:
 Add a check there whenever a subsystem starts working. Past the harness, the
 game itself runs on device only (it needs the GLES device): `scripts/build.sh
 arm64-v8a && scripts/build_apk.sh arm64-v8a && scripts/run.sh`, then
-`adb logcat -s SilentStorm` — the loop logs `game: N steps, M presents,
-interface depth D` every five seconds, and the D3D shim warns on anything it
-refuses. Note `build_apk.sh` only builds ABIs whose library is *missing*; rebuild
-the library explicitly after source changes. The host target builds in
+`adb logcat -s SilentStorm` — the loop logs `perf:` with FPS, frame-interval
+percentiles, work/swap time, skipped draws and GL errors every five seconds.
+`build_apk.sh` now rebuilds native libraries before packaging; `A5_SKIP_BUILD=1`
+is an explicit opt-out for a build that has just completed. The host target builds in
 seconds and is debuggable with lldb, which is how the 64-bit stream bug above was
 found — do not debug engine logic on a device if the host can reproduce it.

@@ -147,8 +147,8 @@ void RunD3DSelfTest( void *pReporter, ReportFn pfnAdd )
         pDev->Clear( 0, 0, D3DCLEAR_TARGET, 0, 1, 0 );
         ++nTotal;
         while ( glGetError() != GL_NO_ERROR ) {}
-        pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1 );
-        if ( glGetError() == GL_NO_ERROR ) ++nLinked;
+        const HRESULT draw = pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1 );
+        if ( draw == D3D_OK && glGetError() == GL_NO_ERROR ) ++nLinked;
     }
     for ( int i = 1; i < 77; ++i )
     {
@@ -156,8 +156,8 @@ void RunD3DSelfTest( void *pReporter, ReportFn pfnAdd )
         pDev->SetVertexShader( vs[ i ] ); pDev->SetPixelShader( ps[ 0 ] );
         ++nTotal;
         while ( glGetError() != GL_NO_ERROR ) {}
-        pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1 );
-        if ( glGetError() == GL_NO_ERROR ) ++nLinked;
+        const HRESULT draw = pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1 );
+        if ( draw == D3D_OK && glGetError() == GL_NO_ERROR ) ++nLinked;
     }
     R( nLinked == nTotal ? BOOT_OK : BOOT_FAIL, "%d/%d shader programs compiled and drew without GL errors", nLinked, nTotal );
 
@@ -185,6 +185,135 @@ void RunD3DSelfTest( void *pReporter, ReportFn pfnAdd )
        pIn[ 0 ], pIn[ 1 ], pIn[ 2 ], pIn[ 3 ], pOut[ 0 ], pOut[ 1 ], pOut[ 2 ], bInside && bOutside ? "confirmed" : "WRONG" );
     (void)rIn;
     pShot->UnlockRect();
+
+    // Program identity follows bytecode, even when COM wrappers are destroyed
+    // and the allocator reuses their addresses for a different shader.
+    GLint constProgram = 0;
+    glGetIntegerv( GL_CURRENT_PROGRAM, &constProgram );
+    bool bShaderLifetimeOK = true;
+    for ( int pass = 0; pass < 32; ++pass )
+    {
+        IDirect3DVertexShader9 *temporary = 0;
+        const bool colored = ( pass % 2 ) == 0;
+        pDev->CreateVertexShader( vsAllShaders[ colored ? 12 : 0 ]->pShader, &temporary );
+        pDev->SetVertexShader( temporary );
+        temporary->Release();
+        pDev->Clear( 0, 0, D3DCLEAR_TARGET, 0, 1, 0 );
+        bShaderLifetimeOK &= pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1 ) == D3D_OK;
+        GLint program = 0;
+        glGetIntegerv( GL_CURRENT_PROGRAM, &program );
+        bShaderLifetimeOK &= colored ? program == constProgram : program != constProgram;
+        pDev->GetFrontBufferData( 0, pShot );
+        pShot->LockRect( &lr, 0, D3DLOCK_READONLY );
+        const unsigned char *pixel = (const unsigned char *)lr.pBits + 245 * lr.Pitch + 10 * 4;
+        bShaderLifetimeOK &= colored ? pixel[ 0 ] > 190 && pixel[ 1 ] > 90 && pixel[ 2 ] > 40
+                                    : pixel[ 0 ] == 0 && pixel[ 1 ] == 0 && pixel[ 2 ] == 0;
+        pShot->UnlockRect();
+        pDev->SetVertexShader( 0 );
+    }
+    R( bShaderLifetimeOK && glGetError() == GL_NO_ERROR ? BOOT_OK : BOOT_FAIL,
+       "shader program cache survives wrapper recreation and reuses identical bytecode" );
+    pDev->SetVertexShader( pVSConst );
+
+    // Append to vertex/index pools while their first range is in flight.
+    // Verify both the pending draw and the old range on a subsequent draw.
+    IDirect3DVertexBuffer9 *pStreamVB = 0;
+    IDirect3DIndexBuffer9 *pStreamIB = 0;
+    const UINT streamPoolBytes = 16 * 1024 * 1024;
+    pDev->CreateVertexBuffer( streamPoolBytes, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                             0, D3DPOOL_DEFAULT, &pStreamVB, 0 );
+    pDev->CreateIndexBuffer( 12, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                            D3DFMT_INDEX16, D3DPOOL_DEFAULT, &pStreamIB, 0 );
+    pDev->SetStreamSource( 0, pStreamVB, 0, sizeof( SVec ) );
+    pDev->SetIndices( pStreamIB );
+    pDev->SetVertexShader( pVSConst );
+    pDev->SetPixelShader( ps[ 0 ] );
+    pDev->Clear( 0, 0, D3DCLEAR_TARGET, 0xFF000000, 1, 0 );
+    bool bStreamingOK = true;
+    const float red[ 4 ] = { 1, 0, 0, 1 };
+    for ( int half = 0; half < 2; ++half )
+    {
+        void *p = 0;
+        pStreamVB->Lock( half * 3 * sizeof( SVec ), 3 * sizeof( SVec ), &p,
+                         half ? D3DLOCK_NOOVERWRITE : D3DLOCK_DISCARD );
+        SVec *v = (SVec *)p;
+        memset( v, 0, 3 * sizeof( SVec ) );
+        v[ 0 ].x = v[ 2 ].x = -0.9f + half;
+        v[ 1 ].x = -0.1f + half;
+        v[ 0 ].y = v[ 1 ].y = -0.9f;
+        v[ 2 ].y = -0.1f;
+        pStreamVB->Unlock();
+        pStreamIB->Lock( half * 6, 6, &p, half ? D3DLOCK_NOOVERWRITE : D3DLOCK_DISCARD );
+        for ( int i = 0; i < 3; ++i ) ( (unsigned short *)p )[ i ] = half * 3 + i;
+        pStreamIB->Unlock();
+        pDev->SetVertexShaderConstantF( 16, half ? red : c16, 1 );
+        bStreamingOK &= pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 6, half * 3, 1 ) == D3D_OK;
+    }
+    for ( int pass = 0; pass < 2; ++pass )
+    {
+        if ( pass )
+        {
+            // Real scenes stream small updates into a multi-megabyte pool.
+            // Exercise distant ranges while repeatedly reading cached data.
+            pDev->SetVertexShaderConstantF( 16, c16, 1 );
+            for ( UINT batch = 1; batch <= 32; ++batch )
+            {
+                void *p = 0;
+                pStreamVB->Lock( batch * 65536, 512, &p, D3DLOCK_NOOVERWRITE );
+                memset( p, 0, 512 );
+                pStreamVB->Unlock();
+                pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 6, 0, 1 );
+            }
+            pDev->Clear( 0, 0, D3DCLEAR_TARGET, 0xFF000000, 1, 0 );
+            for ( int half = 0; half < 2; ++half )
+            {
+                pDev->SetVertexShaderConstantF( 16, half ? red : c16, 1 );
+                bStreamingOK &= pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 6, half * 3, 1 ) == D3D_OK;
+            }
+        }
+        pDev->GetFrontBufferData( 0, pShot );
+        pShot->LockRect( &lr, 0, D3DLOCK_READONLY );
+        const unsigned char *left = (const unsigned char *)lr.pBits + 230 * lr.Pitch + 25 * 4;
+        const unsigned char *right = left + 128 * 4;
+        bStreamingOK &= left[ 0 ] > 190 && left[ 1 ] > 90 && left[ 1 ] < 115 && left[ 2 ] > 40 && left[ 2 ] < 65;
+        bStreamingOK &= right[ 0 ] < 15 && right[ 1 ] < 15 && right[ 2 ] > 240;
+        pShot->UnlockRect();
+    }
+    void *pWait = 0;
+    bStreamingOK &= pStreamVB->Lock( 0, 0, &pWait, 0 ) == D3D_OK;
+    bStreamingOK &= pStreamVB->Unlock() == D3D_OK;
+    bStreamingOK &= pStreamVB->Lock( streamPoolBytes, 1, &pWait, 0 ) == D3DERR_INVALIDCALL;
+    bStreamingOK &= glGetError() == GL_NO_ERROR;
+    R( bStreamingOK ? BOOT_OK : BOOT_FAIL, "DISCARD / NOOVERWRITE: vertex and index appends preserve in-flight draws and stored ranges" );
+
+    // The engine also reuses ranges with NOOVERWRITE before the previous
+    // draw retires. Ordered uploads must preserve that prior draw.
+    pDev->Clear( 0, 0, D3DCLEAR_TARGET, 0xFF000000, 1, 0 );
+    pDev->SetVertexShaderConstantF( 16, c16, 1 );
+    pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 6, 0, 1 );
+    pStreamVB->Lock( 0, 3 * sizeof( SVec ), &pWait, D3DLOCK_NOOVERWRITE );
+    for ( int i = 0; i < 3; ++i ) ( (SVec *)pWait )[ i ].x += 1;
+    pStreamVB->Unlock();
+    pStreamIB->Lock( 0, 6, &pWait, D3DLOCK_NOOVERWRITE );
+    for ( int i = 0; i < 3; ++i ) ( (unsigned short *)pWait )[ i ] = i;
+    pStreamIB->Unlock();
+    pDev->SetVertexShaderConstantF( 16, red, 1 );
+    pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 6, 0, 1 );
+    pDev->GetFrontBufferData( 0, pShot );
+    pShot->LockRect( &lr, 0, D3DLOCK_READONLY );
+    {
+        const unsigned char *left = (const unsigned char *)lr.pBits + 230 * lr.Pitch + 25 * 4;
+        const unsigned char *right = left + 128 * 4;
+        R( left[ 0 ] > 190 && left[ 1 ] > 90 && left[ 2 ] > 40 && left[ 2 ] < 65 &&
+           right[ 0 ] < 15 && right[ 1 ] < 15 && right[ 2 ] > 240 && glGetError() == GL_NO_ERROR ? BOOT_OK : BOOT_FAIL,
+           "overlapping NOOVERWRITE preserves the prior draw when reusing its data" );
+    }
+    pShot->UnlockRect();
+    pDev->SetStreamSource( 0, pVB, 0, sizeof( SVec ) );
+    pDev->SetIndices( pIB );
+    pDev->SetVertexShaderConstantF( 16, c16, 1 );
+    pStreamVB->Release();
+    pStreamIB->Release();
 
     /* ---- render target texture: draw into it, sample it back through psTextureCopyAlpha ---- */
     IDirect3DTexture9 *pRTTex = 0;
@@ -244,6 +373,75 @@ void RunD3DSelfTest( void *pReporter, ReportFn pfnAdd )
         const bool bOK = p[ 0 ] > 240 && p[ 1 ] > 118 && p[ 1 ] < 138 && p[ 2 ] < 15;
         R( bOK ? BOOT_OK : BOOT_FAIL, "managed texture upload + vsTexture/psTextureCopyAlpha: bgr(%d,%d,%d) expect (255,128,0)",
            p[ 0 ], p[ 1 ], p[ 2 ] );
+    }
+    pShot->UnlockRect();
+
+    // The depth prepass and lighting use different vertex programs. Compare
+    // EQUAL-tested lighting against the same draw without a depth test over
+    // several nontrivial transforms, including every covered pixel.
+    bool bEqualDepthOK = true;
+    for ( int pass = 0; pass < 8; ++pass )
+    {
+        float transform[16] = { 0.81371f,0.08113f,0,0.01137f * pass,
+                               -0.06317f,0.83131f,0,0.00573f * pass,
+                                0.01913f,0.03731f,0.61793f,0.07119f,
+                                0.01037f,0.02317f,0,1 };
+        pDev->SetVertexShaderConstantF( 10, transform, 4 );
+        pDev->SetVertexShaderConstantF( 16, c16, 1 );
+        pDev->SetRenderState( D3DRS_ZENABLE, TRUE );
+        pDev->SetRenderState( D3DRS_ZWRITEENABLE, TRUE );
+        pDev->SetRenderState( D3DRS_ZFUNC, D3DCMP_LESSEQUAL );
+        pDev->Clear( 0, 0, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0, 1, 0 );
+        pDev->SetRenderState( D3DRS_COLORWRITEENABLE, 0 );
+        pDev->SetVertexShader( vs[3] );
+        pDev->SetPixelShader( ps[2] );
+        pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1 );
+        pDev->SetRenderState( D3DRS_COLORWRITEENABLE, 15 );
+        pDev->SetRenderState( D3DRS_ZWRITEENABLE, FALSE );
+        pDev->SetRenderState( D3DRS_ZFUNC, D3DCMP_EQUAL );
+        pDev->SetVertexShader( pVSConst );
+        pDev->SetPixelShader( ps[0] );
+        pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1 );
+        pDev->GetFrontBufferData( 0, pShot );
+        pShot->LockRect( &lr, 0, D3DLOCK_READONLY );
+        std::vector<unsigned char> equalPixels( 256 * 256 * 4 );
+        for ( int y = 0; y < 256; ++y )
+            memcpy( &equalPixels[y * 256 * 4], (const unsigned char *)lr.pBits + y * lr.Pitch, 256 * 4 );
+        pShot->UnlockRect();
+        pDev->Clear( 0, 0, D3DCLEAR_TARGET, 0, 1, 0 );
+        pDev->SetRenderState( D3DRS_ZENABLE, FALSE );
+        pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1 );
+        pDev->GetFrontBufferData( 0, pShot );
+        pShot->LockRect( &lr, 0, D3DLOCK_READONLY );
+        int covered = 0;
+        for ( int y = 0; y < 256; ++y )
+        {
+            const unsigned char *row = (const unsigned char *)lr.pBits + y * lr.Pitch;
+            bEqualDepthOK &= memcmp( &equalPixels[y * 256 * 4], row, 256 * 4 ) == 0;
+            for ( int x = 0; x < 256; ++x ) covered += row[x * 4] > 190;
+        }
+        bEqualDepthOK &= covered > 10000;
+        pShot->UnlockRect();
+    }
+    R( bEqualDepthOK && glGetError() == GL_NO_ERROR ? BOOT_OK : BOOT_FAIL,
+       "multipass EQUAL depth preserves every covered pixel across vertex programs" );
+    pDev->SetVertexShaderConstantF( 10, identity, 4 );
+    pDev->SetRenderState( D3DRS_ZWRITEENABLE, TRUE );
+    pDev->SetRenderState( D3DRS_ZFUNC, D3DCMP_LESSEQUAL );
+
+    // A missing shader must not reuse the previous draw's valid GL program.
+    // Exercise both entry points and verify that the clear colour survives.
+    pDev->Clear( 0, 0, D3DCLEAR_TARGET, 0xFFFF0000, 1, 0 );
+    pDev->SetPixelShader( 0 );
+    const HRESULT missingIndexed = pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1 );
+    const HRESULT missingArrays = pDev->DrawPrimitive( D3DPT_TRIANGLELIST, 0, 1 );
+    pDev->GetFrontBufferData( 0, pShot );
+    pShot->LockRect( &lr, 0, D3DLOCK_READONLY );
+    {
+        const unsigned char *p = (const unsigned char *)lr.pBits + 245 * lr.Pitch + 10 * 4;
+        R( missingIndexed == D3DERR_INVALIDCALL && missingArrays == D3DERR_INVALIDCALL &&
+           p[0] == 0 && p[1] == 0 && p[2] == 255 ? BOOT_OK : BOOT_FAIL,
+           "missing shader skips both draws and preserves target pixels" );
     }
     pShot->UnlockRect();
 

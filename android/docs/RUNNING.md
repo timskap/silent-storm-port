@@ -14,6 +14,9 @@ build-tools directly. A debug keystore is generated on first run.
 
 Set `ANDROID_SDK_ROOT` / `ANDROID_NDK_HOME` if they are not in the usual place.
 With several devices attached, set `ANDROID_SERIAL` to pick one.
+Native libraries are rebuilt before packaging, including when a `.so` already
+exists. Use `A5_SKIP_BUILD=1` only immediately after a successful native build
+if you want to package those exact libraries without staging/building again.
 
 ## 2. Game data
 
@@ -66,6 +69,25 @@ Everything on screen is also in logcat:
 adb logcat -s SilentStorm
 ```
 
+The game targets 30 FPS using display-vsync callbacks; it stops stepping while
+paused by Android or without window focus. Every five seconds, `perf:` reports
+observed FPS, frame-interval p95/max, game-thread wall time (excluding swap), swap time,
+draws, missing-program draws, and GL errors. A load is included in these timings;
+measure steady play separately from startup. The first window also contains the
+self-test's two deliberately rejected missing-shader draws.
+
+For repeatable mission checks, put `template 4414` in `SilentStorm/mission.cfg`
+and `A5_START_CFG=mission.cfg` in the sibling `files/env.txt`. Restore the previous
+environment after testing. Unlock the device and keep the app in the foreground;
+FPS while a lock screen or screensaver owns focus is not a gameplay measurement.
+Check camera movement, unpaused play, and background/return as well as a still
+frame. A passing shader test does not establish correctness of the whole scene.
+
+`A5_D3D_BUFFER_MAP=1` opts into the candidate mapped-buffer optimisation. It is
+not enabled by default: earlier variants reached the frame-rate target but
+failed sustained visual checks. See [PORTING.md](PORTING.md) for validation
+status. Remove this variable to use the original buffer-upload path.
+
 ## Running without a device
 
 The same checks run headlessly on macOS/Linux:
@@ -74,6 +96,7 @@ The same checks run headlessly on macOS/Linux:
 cmake -S . -B build/host -G Ninja
 cmake --build build/host
 ./build/host/silentstorm_hosttest ../Complete
+ctest --test-dir build/host --output-on-failure
 ```
 
 Exit code is 0 when every check passes, so it works as a CI gate.

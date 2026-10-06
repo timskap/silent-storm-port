@@ -553,6 +553,14 @@ RULES = [
 
 RULES += [
     (
+        "Main/GTexture.cpp",
+        "Identify failed cube-map resources instead of showing an unexplained checkerboard.",
+        "void CFileCubeTexture::CreateChecker()\n{",
+        '''void CFileCubeTexture::CreateChecker()
+{
+    DebugTrace( "[android] cube texture %d: load failed - checkerboard\\n", GetKey() );''',
+    ),
+    (
         "Misc/Tools.h",
         "Sign<int>: replace the setne/sar bit trick with a portable comparison.",
         re.compile(
@@ -1570,7 +1578,7 @@ RULES += [
         "Main/BSPTree.cpp",
         "BSPTree.cpp force-enables ASSERT (hard __debugbreak) and turns MSVC "
         "optimisation off -- a debugging setup left on in the Jan03 tree.  "
-        "Clang ignores the MSVC optimize pragmas, but the live ASSERT makes "
+        "Clang also honours those pragmas (removed by rule set 23); the live ASSERT makes "
         "every BSP node constructor run mesh.CheckClosed(), an O(edges^2) mesh "
         "sweep that dominated mission pass-calc on device (~35% of the game "
         "thread; simpleperf, 2026-08).  Keep the hard ASSERT in debug builds "
@@ -3776,6 +3784,854 @@ RULES += [
 					}
 				}
 			}""",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+#  Rule set 21: the frame rate in a mission.
+# ---------------------------------------------------------------------------
+#  Two things this snapshot does per frame that the shipping game does per
+#  *change* (both decoded from the retail Game.exe by the Silent-Storm-
+#  Reconstruction project, github.com/met-nikita/Silent-Storm-Reconstruction,
+#  and cross-checked against its sources):
+#
+#  * Every CUnitFace on the HUD -- the big selected-unit portrait and the up-to
+#    six party faces -- called CUnitView::SetUnit from its panel's Draw, and
+#    that calls NRender::CreateShowUnit, which builds a complete render clone
+#    of the unit (body model, uniform, head, animator) from scratch.  Seven
+#    full unit builds per frame, every frame.  Retail CUnitFace::SetUnit
+#    (@0x254c80) is a no-op while the tracked unit is unchanged.
+#  * CInfoPanelSpecialSlot::Draw (the Panzerklein cannon slot) rebuilt the 3D
+#    item model (CShowItemModel::Set -> CRPGItem::CreateModel) and allocated a
+#    fresh CToolTip per frame.  Retail (@0x256160) keeps a weapon-in-hand
+#    cache and rebuilds only when the weapon actually changes.
+#
+#  And two occlusion-culling (HSR) behaviours where this snapshot predates the
+#  retail tuning:
+#
+#  * MakeInvisibleElementsList rasterises the static scene on the CPU into a
+#    screenSize/2 buffer; retail clamps that buffer to 400x300 (@0x176d50).
+#  * The snapshot's only HSR mode drops the ignore list on ANY camera motion
+#    and rebuilds it after the camera has been still for 3 frames -- so the
+#    whole time the player pans or zooms (on a touch screen: most of the
+#    time) the scene draws with no occlusion culling at all.  Retail's default
+#    mode (HSR_DYNAMIC, gfx_hsr 2, UpdateIgnoreMark @0x160780) keeps culling
+#    during movement with a persistent fixed-size rasteriser every 2nd frame.
+
+RULES += [
+    (
+        "Main/iUnitPanel.cpp",
+        "CUnitFace: remember which world unit the 3D face was built for, so "
+        "SetUnit can be a no-op when nothing changed.",
+        """	CObj<CLineBar> pLife;
+	CObj<CLineBar> pHealedLife;
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(TBaseClass*)this); f.Add(2,&pUnit); f.Add(3,&pLife); f.Add(4,&pHealedLife); return 0; }""",
+        """	CObj<CLineBar> pLife;
+	CObj<CLineBar> pHealedLife;
+	// [android] the unit the 3D face was last built for; not serialized -- a
+	// loaded panel rebuilds on its first SetUnit.  See SetUnit below.
+	CPtr<NWorld::CUnit> pShownUnit;
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(TBaseClass*)this); f.Add(2,&pUnit); f.Add(3,&pLife); f.Add(4,&pHealedLife); return 0; }""",
+    ),
+    (
+        "Main/iUnitPanel.cpp",
+        "CUnitFace::SetUnit runs every frame from the unit panels' Draw and "
+        "re-created the whole 3D portrait (CreateShowUnit) each time; rebuild "
+        "only when the tracked unit actually changes, as retail does.",
+        """void CUnitFace::SetUnit( NGame::IUnitTracker *_pUnit )
+{
+	pUnit = _pUnit;
+	if ( IsValid( pUnit ) )
+		CUnitView::SetUnit( pUnit->GetUnit() );
+}""",
+        """void CUnitFace::SetUnit( NGame::IUnitTracker *_pUnit )
+{
+	// [android] Both unit panels call this from Draw, i.e. every frame, and
+	// CUnitView::SetUnit -> NRender::CreateShowUnit builds a complete render
+	// clone of the unit (model, uniform, head, animator) on every call --
+	// seven full unit builds per frame with a party on screen.  The retail
+	// CUnitFace::SetUnit (@0x254c80) is a no-op for an unchanged tracker;
+	// the world unit is compared too so the portrait still follows a unit
+	// that is replaced under its tracker (entering a Panzerklein).
+	NWorld::CUnit *pWorldUnit = IsValid( _pUnit ) ? _pUnit->GetUnit() : 0;
+	if ( pUnit == _pUnit && pShownUnit == pWorldUnit )
+		return;
+	pUnit = _pUnit;
+	pShownUnit = pWorldUnit;
+	if ( IsValid( pUnit ) )
+		CUnitView::SetUnit( pWorldUnit );
+}""",
+    ),
+    (
+        "Main/iUnitPanel.cpp",
+        "CInfoPanelSpecialSlot: the weapon-in-hand cache the retail panel keeps "
+        "(retail member +0x94).",
+        """	CObj<CShowItemModel> pItemModel;
+	CObj<CSlotReloadButton> pReload;
+public:
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CWindow*)this); f.Add(2,&pMission); f.Add(3,&pUnit); f.Add(4,&pWeaponAmmoText); f.Add(5,&pAmmoBackground); f.Add(6,&pWeaponAmmo); f.Add(7,&pItemModel); f.Add(8,&pReload); return 0; }""",
+        """	CObj<CShowItemModel> pItemModel;
+	CObj<CSlotReloadButton> pReload;
+	// [android] weapon-in-hand cache: Draw rebuilds the item model only when
+	// this changes (retail @0x256160).  Not serialized -- null after a load,
+	// so the first Draw rebuilds.
+	CPtr<NRPG::IWeaponItemInfo> pWeaponItem;
+public:
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CWindow*)this); f.Add(2,&pMission); f.Add(3,&pUnit); f.Add(4,&pWeaponAmmoText); f.Add(5,&pAmmoBackground); f.Add(6,&pWeaponAmmo); f.Add(7,&pItemModel); f.Add(8,&pReload); return 0; }""",
+    ),
+    (
+        "Main/iUnitPanel.cpp",
+        "CInfoPanelSpecialSlot::Draw rebuilt the cannon's 3D model and a tooltip "
+        "every frame; gate it on the weapon-in-hand cache.",
+        """	CPtr<NRPG::IWeaponItemInfo> pItem = pUnit->GetRPG()->GetCannonItemInfo();
+
+	pItemModel->Set( pItem, NDb::CAMERA_SLOT );""",
+        """	CPtr<NRPG::IWeaponItemInfo> pItem = pUnit->GetRPG()->GetCannonItemInfo();
+
+	// [android] CShowItemModel::Set runs CRPGItem::CreateModel and allocates a
+	// CToolTip on every call; rebuild only on a weapon change (retail @0x256160).
+	if ( pWeaponItem != pItem )
+	{
+		pWeaponItem = pItem;
+		pItemModel->Set( pItem, NDb::CAMERA_SLOT );
+	}""",
+    ),
+    # ---- HSR: the retail dynamic occlusion-culling mode --------------------
+    (
+        "Main/GRenderModes.h",
+        "Add the retail HSR_DYNAMIC mode (keep culling while the camera moves).",
+        """enum EHSRMode
+{
+	HSR_NONE,
+	HSR_FAST,
+	HSR_LAST
+};""",
+        """enum EHSRMode
+{
+	HSR_NONE,
+	HSR_FAST,
+	// [android] retail gfx_hsr 2 (the shipping default): keep occlusion
+	// culling during camera movement
+	HSR_DYNAMIC,
+	HSR_LAST
+};""",
+    ),
+    (
+        "Main/GView.cpp",
+        "gfx_hsr: retail maps 1 to HSR_FAST and >1 to HSR_DYNAMIC (@0x186230).",
+        """static void VarSetHSR( const string &szID, const NGlobal::CValue &sValue, void *pContext )
+{
+	defaultHSRMode = HSR_NONE;
+	if ( sValue.GetFloat() != 0 )
+		defaultHSRMode = HSR_FAST;
+}""",
+        """static void VarSetHSR( const string &szID, const NGlobal::CValue &sValue, void *pContext )
+{
+	// [android] retail @0x186230: 1 -> HSR_FAST, >1 -> HSR_DYNAMIC (the
+	// shipping default is gfx_hsr 2 => DYNAMIC)
+	defaultHSRMode = HSR_NONE;
+	if ( sValue.GetFloat() == 1 )
+		defaultHSRMode = HSR_FAST;
+	if ( sValue.GetFloat() > 1 )
+		defaultHSRMode = HSR_DYNAMIC;
+}""",
+    ),
+    (
+        "Main/GView.cpp",
+        "gfx_hsr defaults to 2 (HSR_DYNAMIC), as in the shipping game.",
+        """	REGISTER_VAR( "gfx_hsr", VarSetHSR, 1, true )""",
+        """	REGISTER_VAR( "gfx_hsr", VarSetHSR, 2, true )   // [android] retail default 2 = HSR_DYNAMIC""",
+    ),
+    (
+        "Main/GSceneInternal.h",
+        "The HSR_DYNAMIC reuse counter (retail +0x1b8, not serialized).",
+        """	int nCurrentIgnoreMark;
+	int nIgnoreListWasCalced;""",
+        """	int nCurrentIgnoreMark;
+	int nIgnoreListWasCalced;
+	// [android] HSR_DYNAMIC frame counter -- reuse the current ignore list
+	// while the camera moves, recalculate on every 2nd frame (retail +0x1b8,
+	// not serialized)
+	int nReuseIgnoreList;""",
+    ),
+    (
+        "Main/GSceneInternal.h",
+        "UpdateIgnoreMark needs the HSR mode to keep culling while the camera "
+        "moves.",
+        """	void UpdateIgnoreMark( IRender *pRender, CTransformStack *pTS, const SGroupSelect &mask );""",
+        """	void UpdateIgnoreMark( IRender *pRender, CTransformStack *pTS, const SGroupSelect &mask, EHSRMode hsrMode );   // [android] + hsrMode""",
+    ),
+    (
+        "Main/GSceneInternal.cpp",
+        "Initialise the HSR_DYNAMIC reuse counter next to the ignore mark.",
+        """	nCurrentIgnoreMark = 1;""",
+        """	nCurrentIgnoreMark = 1;
+	nReuseIgnoreList = 0;   // [android]""",
+    ),
+    (
+        "Main/GSceneInternal.cpp",
+        "UpdateIgnoreMark: the retail HSR_DYNAMIC logic (@0x160780) -- keep the "
+        "ignore list alive during camera movement and refresh it with the "
+        "fixed-size rasteriser every 2nd frame instead of dropping it.",
+        """void CGScene::UpdateIgnoreMark( IRender *pRender, CTransformStack *pTS, const SGroupSelect &mask )
+{
+	bool bStaticUpdated = pIgnoreStaticTrack.Refresh();
+	if ( bStaticUpdated || pTS->Get().forward != mHoldTransform || holdMask != mask )
+	{
+		++nCurrentIgnoreMark;  
+		nIgnoreListWasCalced = 0;//false;
+		pHZBuffer = 0;
+	}
+	else
+	{
+		if ( nIgnoreListWasCalced == 2 )
+		{
+			++nCurrentIgnoreMark;
+			CIgnorePartsHash res;
+			MakeInvisibleElementsList( pRender, pTS, mask, GetScreenRect(), &res, &pHZBuffer );
+			for ( typename CIgnorePartsHash::iterator i = res.begin(); i != res.end(); ++i )
+			{
+				CDynamicCast<CCombinedPart> pC( i->first );
+				pC->SetIgnored( nCurrentIgnoreMark, i->second );
+			}
+		}
+		++nIgnoreListWasCalced;
+	}
+	mHoldTransform = pTS->Get().forward;
+	holdMask = mask;
+}""",
+        """void CGScene::UpdateIgnoreMark( IRender *pRender, CTransformStack *pTS, const SGroupSelect &mask, EHSRMode hsrMode )
+{
+	bool bStaticUpdated = pIgnoreStaticTrack.Refresh();
+	const SHMatrix &m = pTS->Get().forward;
+	// [android] Retail HSR (@0x160780, decoded in Silent-Storm-Reconstruction).
+	// This snapshot dropped the ignore list on ANY camera motion and rebuilt it
+	// only after the camera had been still for three frames, so the scene drew
+	// with no occlusion culling for as long as the camera was moving.  Retail
+	// distinguishes a *big* change -- static geometry changed, the camera
+	// translated more than a metre, or the mask changed -- from mere motion,
+	// and under HSR_DYNAMIC keeps the current list while the camera moves,
+	// refreshing it with the fixed-size rasteriser on every 2nd frame (and at
+	// once on a big change).  The full-resolution list is still built once the
+	// camera has been still for three frames, exactly as before.
+	bool bChanged = bStaticUpdated
+		|| sqr( m.xw - mHoldTransform.xw ) + sqr( m.yw - mHoldTransform.yw ) + sqr( m.zw - mHoldTransform.zw ) > 1.0f
+		|| holdMask != mask;
+	if ( !bChanged && !( m != mHoldTransform ) )
+	{
+		if ( nIgnoreListWasCalced == 2 )
+		{
+			++nCurrentIgnoreMark;
+			CIgnorePartsHash res;
+			MakeInvisibleElementsList( pRender, pTS, mask, GetScreenRect(), &res, &pHZBuffer );
+			for ( typename CIgnorePartsHash::iterator i = res.begin(); i != res.end(); ++i )
+			{
+				CDynamicCast<CCombinedPart> pC( i->first );
+				pC->SetIgnored( nCurrentIgnoreMark, i->second );
+			}
+		}
+		++nIgnoreListWasCalced;
+	}
+	else if ( hsrMode != HSR_DYNAMIC )
+	{
+		++nCurrentIgnoreMark;
+		nIgnoreListWasCalced = 0;
+		pHZBuffer = 0;
+	}
+	else
+	{
+		++nReuseIgnoreList;
+		nIgnoreListWasCalced = 0;
+		if ( nReuseIgnoreList >= 2 || bChanged )
+		{
+			++nCurrentIgnoreMark;
+			nReuseIgnoreList = 0;
+			pHZBuffer = 0;
+			CIgnorePartsHash res;
+			MakeInvisibleElementsListFast( pRender, pTS, mask, GetScreenRect(), &res, &pHZBuffer );
+			for ( typename CIgnorePartsHash::iterator i = res.begin(); i != res.end(); ++i )
+			{
+				CDynamicCast<CCombinedPart> pC( i->first );
+				pC->SetIgnored( nCurrentIgnoreMark, i->second );
+			}
+		}
+	}
+	mHoldTransform = m;
+	holdMask = mask;
+}""",
+    ),
+    (
+        "Main/GSceneInternal.cpp",
+        "Pass the view's HSR mode down to UpdateIgnoreMark.",
+        """	if ( hsrMode != HSR_NONE )
+	{
+		UpdateIgnoreMark( &renderWrapper, pClipTS, mask );
+		nUseIgnoreMark = nCurrentIgnoreMark;
+	}""",
+        """	if ( hsrMode != HSR_NONE )
+	{
+		UpdateIgnoreMark( &renderWrapper, pClipTS, mask, hsrMode );   // [android] + hsrMode
+		nUseIgnoreMark = nCurrentIgnoreMark;
+	}""",
+    ),
+    (
+        "Main/GShadowVolume.cpp",
+        "Clamp the CPU occlusion rasteriser to the retail 400x300 (@0x176d50); "
+        "this snapshot rasterised at screenSize/2.",
+        """	CPartsRender pr( Max( 4, (int)screenSize.x / 2 ), Max( 4, (int)screenSize.y / 2 ) );""",
+        """	// [android] retail @0x176d50: width x/2 clamped [4,400], height y/2 clamped [4,300]
+	CPartsRender pr( Min( 400, Max( 4, (int)screenSize.x / 2 ) ), Min( 300, Max( 4, (int)screenSize.y / 2 ) ) );""",
+    ),
+    (
+        "Main/GShadowVolume.h",
+        "Declare the HSR_DYNAMIC recalc pass.",
+        """void MakeInvisibleElementsList( IRender *pRender, CTransformStack *pTS, 
+	const SGroupSelect &mask, const CVec2 &screenSize, CIgnorePartsHash *pIgnore, 
+	CObj<IHZBuffer> *pHZBuffer );""",
+        """void MakeInvisibleElementsList( IRender *pRender, CTransformStack *pTS, 
+	const SGroupSelect &mask, const CVec2 &screenSize, CIgnorePartsHash *pIgnore, 
+	CObj<IHZBuffer> *pHZBuffer );
+// [android] the retail HSR_DYNAMIC recalc during camera movement (@0x1770f0):
+// the same marking loop over a persistent fixed-size rasteriser
+void MakeInvisibleElementsListFast( IRender *pRender, CTransformStack *pTS,
+	const SGroupSelect &mask, const CVec2 &screenSize, CIgnorePartsHash *pIgnore,
+	CObj<IHZBuffer> *pHZBuffer );""",
+    ),
+    (
+        "Main/GShadowVolume.cpp",
+        "The retail HSR_DYNAMIC occlusion pass (@0x1770f0): the same marking "
+        "loop as MakeInvisibleElementsList over a persistent 400x300 rasteriser "
+        "and HZ buffer, cheap enough to run every 2nd frame while the camera "
+        "moves.",
+        None,
+        """
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// [android] The retail HSR_DYNAMIC occlusion pass (Game.exe @0x1770f0, decoded in
+// Silent-Storm-Reconstruction): the same marking loop as MakeInvisibleElementsList,
+// but over a persistent fixed-size 400x300 rasteriser and a persistent HZ buffer
+// instead of screen-sized ones allocated on every call -- it runs every second
+// frame while the camera moves, so setup cost matters.  RenderStuff resets every
+// part's ref count on each call, so reusing the rasteriser is safe; screenSize is
+// unused but kept for symmetry with the full-resolution variant.  (The file has
+// closed namespace NGScene by this point -- reopen it, or this would define a
+// fresh global and the one the header declares stays undefined.)
+namespace NGScene
+{
+void MakeInvisibleElementsListFast( IRender *pRender, CTransformStack *pTS,
+	const SGroupSelect &_mask, const CVec2 &screenSize, CIgnorePartsHash *pIgnore,
+	CObj<IHZBuffer> *pHZBuffer )
+{
+	static CPartsRender pr( 400, 300 );
+	static CObj<CHZBuffer> pPersistentHZ;
+	list<SRenderPartSet> listParts;
+	pRender->FormPartList( pTS, &listParts,IRender::DT_STATIC, _mask );
+	pr.FastInitZBuffer();
+	RenderStuff( pr, pRender, pTS, listParts );
+
+	if ( !IsValid( pPersistentHZ ) )
+		pPersistentHZ = new CHZBuffer;
+	CHZBuffer *pHZ = pPersistentHZ;
+	*pHZBuffer = pHZ;
+	pr.BuildHZ( pHZ );
+
+	int nID = 0;
+	for ( list<SRenderPartSet>::iterator i = listParts.begin(); i != listParts.end(); i++ )
+	{
+		SRenderPartSet &rps = *i;
+		CIgnorePartsHash::iterator res = pIgnore->end();
+		const vector<SSphere> &bounds = rps.pGeometry->pVertices->GetBounds();
+		for ( int k = 0; k < rps.pParts->size(); ++k )
+		{
+			++nID;
+			bool bIsVisible = false;
+			if ( rps.parts.IsSet(k) && !rps.castShadow.IsSet( k ) )
+				bIsVisible = pHZ->IsVisible( bounds[k], pTS );
+			bIsVisible |= pr.GetRefs( nID ) != 0;
+
+			if ( !bIsVisible )
+			{
+				if ( res == pIgnore->end() )
+				{
+					(*pIgnore)[ rps.pNode.GetPtr() ].Clear();
+					res = pIgnore->find( rps.pNode.GetPtr() );
+				}
+				res->second.Set( k );
+			}
+		}
+	}
+}
+}   // namespace NGScene ([android] reopened above)
+""",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+#  Rule set 22: the loading screen.
+# ---------------------------------------------------------------------------
+#  This snapshot predates the retail loading screen (iLoading.obj): a mission
+#  load shows one static ShowLogo() frame -- and its logo texture (1744) is not
+#  in the retail data, so on the port the whole load was a black screen that
+#  looks exactly like a hang.  The shipping game builds a small interface from
+#  UI container 419 -- a full-screen "background" image the code points at a
+#  splash texture (default UITexture 883/0x373, or the zone's PWLImageID), a
+#  bottom-right "video" box that played res/video/loading.bik as the progress
+#  indicator, and two text lines the template draws itself -- and pumps it
+#  through ShowLoadingScreen(percent) at load-time checkpoints.  The lifecycle
+#  and the checkpoint placement follow the reconstruction of the retail
+#  iLoading.obj in Silent-Storm-Reconstruction (RVAs cited in the code below).
+#  Bink is not licensed on this port, so the video box gets a plain progress
+#  bar drawn with CImageDraw colour fills instead of the movie.
+
+RULES += [
+    (
+        "Main/iMain.h",
+        "Forward-declare the splash texture record for the loading screen API.",
+        """namespace NInput
+{
+	struct SEvent;
+}""",
+        """namespace NInput
+{
+	struct SEvent;
+}
+// [android] for the loading-screen API below
+namespace NDb
+{
+	class CUITexture;
+}""",
+    ),
+    (
+        "Main/iMain.h",
+        "Declare the loading-screen lifecycle (retail iLoading.obj).",
+        """void DoneInterface();
+void ShowLogo();""",
+        """void DoneInterface();
+void ShowLogo();
+// [android] the retail loading screen (iLoading.obj), recreated in iMain.cpp:
+// a splash + progress interface shown at load-time checkpoints.
+void SetLoadingImage( NDb::CUITexture *pTexture );   // null -> the generic splash (883)
+void ShowLoadingScreen( int nProgress );             // 0..100; throttled redraw + flip
+void TermLoadingScreen();                            // drop the cached interface""",
+    ),
+    (
+        "Main/iMain.cpp",
+        "Headers for the loading screen: CImageDraw and the UITexture record.",
+        """#include "GResource.h\"""",
+        """#include "GResource.h"
+// [android] for the loading screen below (UIWrap.h needs the scene-utils types)
+#include "Transform.h"
+#include "GSceneUtils.h"
+#include "RectLayout.h"
+#include "UIWrap.h"
+#include "../DBFormat/DataInterface.h\"""",
+    ),
+    (
+        "Main/iMain.cpp",
+        "The loading screen itself: the retail CLoadingUI (ctor @0x1f1eb0, "
+        "SetImage @0x1f1e50, SetProgress @0x1f1d40, Draw @0x1f1d90) over this "
+        "snapshot's own UI classes, and the NGame lifecycle free functions "
+        "(Init @0x1f1ef0, Show @0x1f1de0, SetLoadingImage @0x1f1e70, Term "
+        "@0x1f2130), lazily initialised on first use.",
+        """////////////////////////////////////////////////////////////////////////////////////////////////////
+void ShowSplash( NDb::CUIContainer *pUI, const CArray2D<NGfx::SPixel8888> &sScreenShot )""",
+        """////////////////////////////////////////////////////////////////////////////////////////////////////
+// [android] The retail loading screen (iLoading.obj; lifecycle and layout from
+// the Silent-Storm-Reconstruction decode of Game.exe).  UI container 419 holds
+// a full-screen "background" image (the splash goes in at Draw time, exactly as
+// retail CLoadingUI::Draw @0x1f1d90 does), a bottom-right "video" box that
+// retail filled with the loading.bik progress movie, and two text lines the
+// template draws itself.  Bink is not licensed on this port, so the video box
+// gets a plain progress bar drawn with CImageDraw colour fills.
+class CLoadingUI: public NUI::CWindow
+{
+	OBJECT_NOCOPY_METHODS(CLoadingUI);
+private:
+	int nImageID;
+	int nProgress;
+	CPtr<NUI::CImage> pBackground;
+	NUI::SRect sBarRect;
+	CObj<NUI::CImageDraw> pBarBack;
+	CObj<NUI::CImageDraw> pBarFill;
+public:
+	CLoadingUI(): nImageID( -1 ), nProgress( 0 ), sBarRect( 914, 700, 1016, 718 ) {}
+	CLoadingUI( const NUI::SWindowInfo &sInfo ):
+		NUI::CWindow( sInfo ), nImageID( -1 ), nProgress( 0 ), sBarRect( 914, 700, 1016, 718 ) {}
+
+	// retail SetImage @0x1f1e50: adopt a live record's id as the splash id
+	void SetImage( NDb::CUITexture *pTexture )
+	{
+		if ( IsValid( pTexture ) )
+			nImageID = pTexture->GetRecordID();
+	}
+	void SetProgress( int nValue )
+	{
+		nProgress = Min( Max( nValue, 0 ), 100 );
+	}
+	bool ProcessMessage( const NUI::SEvent &sEvent )
+	{
+		if ( sEvent.nEvent == NUI::EVENT_TEMPLATELOAD )
+		{
+			// the box the retail template reserves for the progress movie;
+			// centre the bar vertically in it
+			if ( sEvent.pLoader->HasControl( "video" ) )
+			{
+				const NUI::SWindowInfo &sVideo = sEvent.pLoader->GetControl( "video" );
+				const int nMidY = sVideo.sPosition.y + sVideo.sSize.y / 2;
+				sBarRect = NUI::SRect( sVideo.sPosition.x + 8, nMidY - 9,
+					sVideo.sPosition.x + sVideo.sSize.x - 8, nMidY + 9 );
+			}
+		}
+		else if ( sEvent.nEvent == NUI::EVENT_TEMPLATELOADCOMPLETE )
+		{
+			pBackground = NUI::GetUIWindow<NUI::CImage>( this, "background" );
+			pBarBack = new NUI::CImageDraw( sBarRect, 0, NUI::SRect( 0, 0, 0, 0 ),
+				NGfx::SPixel8888( 0x14, 0x10, 0x0C, 0xC0 ) );
+			pBarFill = new NUI::CImageDraw( NUI::SRect( sBarRect.x1 + 2, sBarRect.y1 + 2, sBarRect.x1 + 2, sBarRect.y2 - 2 ), 0, NUI::SRect( 0, 0, 0, 0 ),
+				NGfx::SPixel8888( 0xB4, 0x99, 0x7C, 0xFF ) );
+		}
+		return NUI::CWindow::ProcessMessage( sEvent );
+	}
+	void Draw( const STime &sTime, NGScene::I2DGameView *pView )
+	{
+		// retail Draw @0x1f1d90: point the background at the splash, then the
+		// base CWindow::Draw recurse; the bar draws over the template
+		if ( IsValid( pBackground ) )
+			pBackground->SetImage( NDb::GetUITexture( nImageID ), NUI::SRect( 0, 0, 0, 0 ) );
+		NUI::CWindow::Draw( sTime, pView );
+		if ( IsValid( pBarBack ) )
+			pBarBack->Draw( this, sTime, pView );
+		if ( IsValid( pBarFill ) )
+		{
+			const int nInner = sBarRect.x2 - sBarRect.x1 - 4;
+			pBarFill->SetWindow( NUI::SRect( sBarRect.x1 + 2, sBarRect.y1 + 2,
+				sBarRect.x1 + 2 + nInner * nProgress / 100, sBarRect.y2 - 2 ) );
+			pBarFill->Draw( this, sTime, pView );
+		}
+	}
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// the three retail loading-screen globals (@0x9c6574 / 0x9c6570 / 0x9c656c) and
+// the ShowLoadingScreen throttle stamp
+static CObj<CLoadingUI> pLoadingUI;
+static CObj<NUI::CInterface> pLoadingInterface;
+static CPtr<NUI::ICursor> pLoadingCursor;
+static DWORD dwPrevLoadingFlip = 0;
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail InitLoadingScreen @0x1f1ef0, run lazily on first use: an invisible
+// cursor, an interface of its own, the loading window on container 419 (0x1a3),
+// splash defaulted to UITexture 883 (0x373)
+static void InitLoadingScreen()
+{
+	if ( IsValid( pLoadingUI ) )
+		return;
+	NDb::CUIContainer *pTemplate = NDb::GetUIContainer( 419 );
+	if ( !pTemplate )
+		return;
+	pLoadingCursor = NUI::ICursor::Create( false );
+	pLoadingInterface = new NUI::CInterface( pLoadingCursor, 0 );
+	pLoadingUI = new CLoadingUI( NUI::SWindowInfo( pLoadingInterface, NUI::SPoint( 0, 0 ), pLoadingInterface->GetSize(), "loading", NUI::STYLE_VISIBLE | NUI::STYLE_ENABLED ) );
+	NUI::LoadTemplate( pLoadingUI, pTemplate );
+	pLoadingUI->ShowWindow( NUI::SWTYPE_SHOW );
+	pLoadingUI->SetImage( NDb::GetUITexture( 883 ) );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail SetLoadingImage @0x1f1e70: a live record, else the generic splash
+void SetLoadingImage( NDb::CUITexture *pTexture )
+{
+	InitLoadingScreen();
+	if ( !IsValid( pLoadingUI ) )
+		return;
+	if ( IsValid( pTexture ) )
+		pLoadingUI->SetImage( pTexture );
+	else
+		pLoadingUI->SetImage( NDb::GetUITexture( 883 ) );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail ShowLoadingScreen @0x1f1de0: record the percent, then a ~50ms-throttled
+// step + draw + flip
+void ShowLoadingScreen( int nProgress )
+{
+	InitLoadingScreen();
+	if ( !IsValid( pLoadingUI ) )
+		return;
+	pLoadingUI->SetProgress( nProgress );
+	const DWORD dwNow = GetTickCount();
+	int nDelta = (int)( dwNow - dwPrevLoadingFlip );
+	if ( nDelta < 0 )
+		nDelta = -nDelta;
+	if ( nDelta <= 49 )
+		return;
+	dwPrevLoadingFlip = dwNow;
+	MarkNewDGFrame();
+	pLoadingInterface->Step( 0 );
+	pLoadingInterface->Draw( 0 );
+	NGScene::Flip();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail TermLoadingScreen @0x1f2130, paired with DoneInterface
+void TermLoadingScreen()
+{
+	pLoadingUI = 0;
+	pLoadingInterface = 0;
+	pLoadingCursor = 0;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void ShowSplash( NDb::CUIContainer *pUI, const CArray2D<NGfx::SPixel8888> &sScreenShot )""",
+    ),
+    (
+        "Main/iMain.cpp",
+        "Tear the loading screen down with the interfaces (retail DoneInterface "
+        "@0x1f5110 pairs the boot InitLoadingScreen).",
+        """void DoneInterface()
+{
+	interfaces.clear();
+}""",
+        """void DoneInterface()
+{
+	interfaces.clear();
+	TermLoadingScreen();   // [android] retail DoneInterface @0x1f5110
+}""",
+    ),
+    (
+        "Main/iMission.cpp",
+        "Mission start: open the loading screen at 0% with the zone's splash "
+        "(retail CICBeginMission::Exec @0x20ba00) instead of the one-frame "
+        "ShowLogo whose texture the retail data does not even carry.",
+        """void CICBeginMission::Exec()
+{
+	NMainLoop::ShowLogo();
+
+	CMission *pRes = new CMission();""",
+        """void CICBeginMission::Exec()
+{
+	// [android] retail @0x20ba00: the zone's pre-world-load splash if it has
+	// one, else the generic loading splash; then the first frame at 0%.
+	NDb::CUITexture *pSplash = 0;
+	if ( IsValid( pZone ) && IsValid( pZone->GetDBZone() ) )
+		pSplash = pZone->GetDBZone()->pPWLImage;
+	NMainLoop::SetLoadingImage( pSplash );
+	NMainLoop::ShowLoadingScreen( 0 );
+
+	CMission *pRes = new CMission();""",
+    ),
+    (
+        "Main/iMission.cpp",
+        "Same for the map-editor entry point.",
+        """void CICMapEditBeginMission::Exec()
+{
+	NMainLoop::ShowLogo();
+	CMission *pRes = new CMission();""",
+        """void CICMapEditBeginMission::Exec()
+{
+	NMainLoop::SetLoadingImage( 0 );      // [android] was ShowLogo()
+	NMainLoop::ShowLoadingScreen( 0 );
+	CMission *pRes = new CMission();""",
+    ),
+    (
+        "Main/iMission.cpp",
+        "Loading checkpoint at 25%: pre-world setup done, the world load/build "
+        "occupies the retail band [25,50].",
+        """	if ( IsValid( pZone ) )
+		LoadWorld( NStr::Format( "%d.sav", pZone->GetDBZone()->GetRecordID() ) );""",
+        """	NMainLoop::ShowLoadingScreen( 25 );   // [android] retail band [25,50]: world load+build
+
+	if ( IsValid( pZone ) )
+		LoadWorld( NStr::Format( "%d.sav", pZone->GetDBZone()->GetRecordID() ) );""",
+    ),
+    (
+        "Main/iMission.cpp",
+        "Loading checkpoint at 50%: the world object is built.",
+        """	else
+		pWorld->CreateRestored();
+
+	NDb::CMusic *pAmbientMelody = NDb::GetMusic( 1 );""",
+        """	else
+		pWorld->CreateRestored();
+
+	NMainLoop::ShowLoadingScreen( 50 );   // [android] retail band [50,75]: scene/sound/render
+
+	NDb::CMusic *pAmbientMelody = NDb::GetMusic( 1 );""",
+    ),
+    (
+        "Main/iMission.cpp",
+        "Loading checkpoint at 75%: scene, sound, render and interface exist.",
+        """	pInterface = new NUI::CInterface( pCursor, pSoundScene );
+
+	playersSet.resize( pGlobalGame->players.size() );""",
+        """	pInterface = new NUI::CInterface( pCursor, pSoundScene );
+
+	NMainLoop::ShowLoadingScreen( 75 );   // [android] retail band [75,100]: players, states, HUD
+
+	playersSet.resize( pGlobalGame->players.size() );""",
+    ),
+    (
+        "Main/iMission.cpp",
+        "Loading checkpoint at 100%: the mission is fully initialised.",
+        """	pWorld->RunPostInit( pPostInfo );
+
+	return true;
+}""",
+        """	pWorld->RunPostInit( pPostInfo );
+
+	NMainLoop::ShowLoadingScreen( 100 );   // [android] retail finish helper @0x1fb600
+
+	return true;
+}""",
+    ),
+    # ---- the zone's splash art ---------------------------------------------
+    (
+        "DBFormat/DataScenario.h",
+        "The splash record type for the zone's loading image.",
+        """class CString;
+class CDBScenarioClue;""",
+        """class CString;
+class CDBScenarioClue;
+class CUITexture;   // [android] the zone's loading splash""",
+    ),
+    (
+        "DBFormat/DataScenario.h",
+        "CDBScenarioZone: the retail PWLImageID column (the zone's loading "
+        "splash, release [pDBZone+0x48]); this snapshot's class predates it.",
+        """	int nCluesMaxNumber;
+	bool bCanBeRevealed;
+	ZEND int operator&( CStructureSaver &f )""",
+        """	int nCluesMaxNumber;
+	bool bCanBeRevealed;
+	// [android] retail [pDBZone+0x48]: the zone's pre-world-load splash
+	// (UITextures id from the PWLImageID column).  Not serialized -- Import
+	// fills it on every load.
+	CPtr<CUITexture> pPWLImage;
+	ZEND int operator&( CStructureSaver &f )""",
+    ),
+    (
+        "DBFormat/DataScenario.cpp",
+        "Import the zone's PWLImageID splash reference.",
+        """	NDatabase::ImportField( "CanBeRevealed", &bCanBeRevealed );
+}""",
+        """	NDatabase::ImportField( "CanBeRevealed", &bCanBeRevealed );
+	NDatabase::ImportField( "PWLImageID", &pPWLImage );   // [android] the zone's loading splash
+}""",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Rule set 23: on-device simpleperf found BSP construction dominating both
+# mission loading and pass-calc jobs. Clang honours MSVC optimize("", off)
+# under -fms-extensions (emits optnone), even in an -O2 release build.
+# Static/memory geometry without stored BSPs also rebuilt them at every query.
+# Fill those missing trees once per geometry revision; skinned geometry keeps
+# its existing per-pose behaviour, and terrain keeps its specialised builder.
+# ---------------------------------------------------------------------------
+RULES += [
+    (
+        "Main/BSPTree.cpp",
+        "Remove file-local MSVC optimisation switches: NDK Clang honours off "
+        "and emits optnone in release builds. Use the build configuration.",
+        re.compile(r'^#pragma optimize\([^\n]*\)\s*$', re.MULTILINE),
+        "// [android] Optimisation follows the build configuration.",
+    ),
+    (
+        "Main/aiObject.h",
+        "Declare once-per-geometry construction of missing static BSP trees.",
+        "\tvoid CalcBSPTrees( bool bTerrain = false );",
+        "\tvoid CalcBSPTrees( bool bTerrain = false );\n\tvoid CalcMissingBSPTrees(); // [android] static geometry only",
+    ),
+    (
+        "Main/aiObject.cpp",
+        "Cache missing BSP trees in their owning static geometry; retain stored trees.",
+        "void CGeometryInfo::SetBSPTrees( const CBSPPieces &trees )",
+        """void CGeometryInfo::CalcMissingBSPTrees()
+{
+    for ( CPieceMap::iterator i = pieces.begin(); i != pieces.end(); ++i )
+    {
+        SPiece &p = i->second;
+        if ( !p.trees.empty() || p.points.empty() )
+            continue;
+        vector<STriangle> tris;
+        p.edges.BuildTriangleList( &tris );
+        // Same builder as CCollider's fallback, with geometry-owned lifetime.
+        CPtr<CBSPTree> tree = CreateBSPTree( p.points, tris );
+        if ( IsValid( tree ) ) p.trees.push_back( tree );
+    }
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CGeometryInfo::SetBSPTrees( const CBSPPieces &trees )""",
+    ),
+    (
+        "Main/aiObjectLoader.cpp",
+        "Build absent BSPs once after loading static geometry, not on each collider query.",
+        "\t\tpValue->CalcBound();\n\t\tpValue->massCenter = CalcMassCenter( pValue->spheres );",
+        "\t\tpValue->CalcMissingBSPTrees(); // [android] cache the collider fallback\n\t\tpValue->CalcBound();\n\t\tpValue->massCenter = CalcMassCenter( pValue->spheres );",
+    ),
+    (
+        "Main/aiObjectLoader.cpp",
+        "Memory geometry is replaced on Recalc (destruction/debris); build its BSP once per revision.",
+        "\tpValue->AddPiece( -1, p.points, p.tris, 0 );\n\tpValue->CalcBound();",
+        "\tpValue->AddPiece( -1, p.points, p.tris, 0 );\n\tpValue->CalcMissingBSPTrees(); // [android] new geometry revision\n\tpValue->CalcBound();",
+    ),
+]
+
+
+# Rule set 24: scene state accompanying GPU timing during port validation.
+# The retail PAUSE control is text, not the image expected by this snapshot.
+# Bind its common window interface and trace the actual simulation state.
+RULES += [
+    (
+        "Main/GTerrainTexture.cpp",
+        "Optional diagnostics for terrain fallback textures during render validation.",
+        "void CTerrainTexture::UseFake()\n{",
+        '''void CTerrainTexture::UseFake()
+{
+    if ( getenv( "A5_TEXTURE_TRACE" ) )
+    {
+        static int reports = 0;
+        if ( reports++ < 24 )
+            DebugTrace( "[android] terrain fallback region=%d,%d-%d,%d bump=%d cached128=%d inflight=%d\\n",
+                        nrRegion.x1, nrRegion.y1, nrRegion.x2, nrRegion.y2,
+                        (int)bBumpTexture, (int)IsValid( pTex128 ), (int)HasFileRequestsInFly() );
+    }''',
+    ),
+    (
+        "Main/iMissionUI.h",
+        "Accept retail's text PAUSE control as well as the original image control.",
+        "CPtr<CImage> pPause;",
+        "CPtr<CWindow> pPause; // [android] only the shared visibility API is needed",
+    ),
+    (
+        "Main/iMissionUI.cpp",
+        "Bind the PAUSE window independently of its concrete text/image widget type.",
+        'pPause = GetUIWindow<CImage>( this, "pause" );',
+        'pPause = GetUIWindow<CWindow>( this, "pause" );',
+    ),
+    (
+        "Main/iMission.cpp",
+        "Optional scene-state trace alongside the existing frame-time log.",
+        '\t\tDebugTrace( "min %f max %f average %f\\n", 1 / fMaxFrameTime, 1 / fMinFrameTime, nFrames / fElapsed );',
+        '''\t\tDebugTrace( "min %f max %f average %f\\n", 1 / fMaxFrameTime, 1 / fMinFrameTime, nFrames / fElapsed );
+        if ( const char *placement = getenv( "A5_CAMERA_POS" ) )
+        {
+            static bool applied = false;
+            if ( !applied )
+            {
+                ICamera::SCameraPos camera;
+                pCamera->GetPlacement( &camera );
+                if ( sscanf( placement, "%f,%f,%f,%f,%f,%f", &camera.ptAnchor.x, &camera.ptAnchor.y,
+                             &camera.ptAnchor.z, &camera.fRod, &camera.fPitch, &camera.fYaw ) == 6 )
+                    pCamera->SetPlacement( camera );
+                applied = true;
+            }
+        }
+        if ( getenv( "A5_SCENE_TRACE" ) )
+        {
+            ICamera::SCameraPos camera;
+            pCamera->GetPlacement( &camera );
+            DebugTrace( "[android] scene: paused=%d time=%lld camera=(%.2f,%.2f,%.2f) rod=%.2f pitch=%.3f yaw=%.3f showall=%d\\n",
+                        (int)bPause, (long long)sTime, camera.ptAnchor.x, camera.ptAnchor.y, camera.ptAnchor.z,
+                        camera.fRod, camera.fPitch, camera.fYaw, (int)( bShowAllCheat || bCheatVisibility ) );
+        }''',
     ),
 ]
 

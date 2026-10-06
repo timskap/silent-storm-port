@@ -394,6 +394,7 @@ void CheckMenuChain( CReport *pReport )
         { 347, "main menu" }, { 353, "side selection" }, { 354, "hero selection" },
         { 345, "character generation" }, { 361, "face generation" },
         { 161, "options" }, { 335, "save/load" },
+        { 419, "loading screen" },   /* background + "video" progress box (iMain.cpp's CLoadingUI) */
     };
     for ( size_t i = 0; i < sizeof( CONTAINERS ) / sizeof( CONTAINERS[ 0 ] ); ++i )
     {

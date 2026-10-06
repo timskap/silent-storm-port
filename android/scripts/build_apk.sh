@@ -26,10 +26,15 @@ if [ ${#ABIS[@]} -eq 0 ]; then
     ABIS=( arm64-v8a armeabi-v7a x86_64 )
 fi
 
-# Build any ABI whose library is missing.
+# Always update native code before packaging; an existing .so may be stale.
+# Explicit opt-out is useful after a build has just completed successfully.
+if [ "${A5_SKIP_BUILD:-0}" != 1 ]; then
+    "$HERE/build.sh" "${ABIS[@]}"
+fi
 for ABI in "${ABIS[@]}"; do
     if [ ! -f "$BUILD_ROOT/$ABI/libsilentstorm.so" ]; then
-        "$HERE/build.sh" "$ABI"
+        echo "Missing $ABI library; run scripts/build.sh first." >&2
+        exit 1
     fi
 done
 

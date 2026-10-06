@@ -33,7 +33,11 @@ size_t DxtLevelSize( int nDxtVersion, int nWidth, int nHeight );
 
 static A5D3DFrameStats g_stats;
 static bool g_bCountByShader = false;
-static std::map< std::string, int > g_drawsByShader;
+static bool StreamDrawBuffers()
+{
+    static const bool enabled = getenv( "A5_D3D_BUFFER_STREAM" ) != 0;
+    return enabled;
+}
 #define D3DGL_LOG( ... )  a5_log( A5_PRIORITY_INFO,  __VA_ARGS__ )
 #define D3DGL_WARN( ... ) a5_log( A5_PRIORITY_WARN,  __VA_ARGS__ )
 #define D3DGL_ERR( ... )  a5_log( A5_PRIORITY_ERROR, __VA_ARGS__ )
@@ -89,7 +93,10 @@ void CheckGLError( const char *pszWhere )
 {
     GLenum e = glGetError();
     if ( e != GL_NO_ERROR )
-        D3DGL_WARN( "d3d9gles: GL error 0x%04x at %s", e, pszWhere );
+    {
+        ++g_stats.nGLErrors;
+        if ( g_stats.nGLErrors <= 8 ) D3DGL_WARN( "d3d9gles: GL error 0x%04x at %s", e, pszWhere );
+    }
 }
 
 /* ---- format description --------------------------------------------------- */
@@ -619,10 +626,16 @@ public:
     UINT    nSize;
     std::vector< uint8_t > shadow;
     std::vector< std::pair< UINT, UINT > > dirty;
+    std::vector< std::pair< UINT, UINT > > used;
+    // Debug-only coverage: discarded/uninitialised bytes must not be compared
+    // with the CPU shadow when checking a long-running scene.
+    std::vector< std::pair< UINT, UINT > > initialized;
+    int lastVerifiedPresent = -1;
     int     nLockCount;
     bool    bDiscardPending;
+    bool    bNoOverwrite;
 
-    CBufferBase() : nGL( 0 ), target( GL_ARRAY_BUFFER ), nSize( 0 ), nLockCount( 0 ), bDiscardPending( false ) {}
+    CBufferBase() : nGL( 0 ), target( GL_ARRAY_BUFFER ), nSize( 0 ), nLockCount( 0 ), bDiscardPending( false ), bNoOverwrite( false ) {}
     ~CBufferBase() { if ( nGL ) glDeleteBuffers( 1, &nGL ); }
 
     void Create( GLenum _target, UINT size )
@@ -637,6 +650,11 @@ public:
     }
     HRESULT Lock( UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags )
     {
+        if ( !ppbData || OffsetToLock >= nSize || SizeToLock > nSize - OffsetToLock )
+            return D3DERR_INVALIDCALL;
+        if ( nLockCount == 0 )
+            bNoOverwrite = true;
+        bNoOverwrite = bNoOverwrite && ( ( Flags & ( D3DLOCK_NOOVERWRITE | D3DLOCK_DISCARD ) ) != 0 );
         if ( Flags & D3DLOCK_DISCARD )
             bDiscardPending = true;
         ++nLockCount;
@@ -648,9 +666,9 @@ public:
     }
     void MarkDirty( UINT nOffset, UINT nBytes )
     {
-        if ( nBytes == 0 )
+        if ( nBytes == 0 || nOffset >= nSize )
             return;
-        if ( nOffset + nBytes > nSize )
+        if ( nBytes > nSize - nOffset )
             nBytes = nSize - nOffset;
         /* merge with the previous range if contiguous or overlapping */
         if ( !dirty.empty() )
@@ -666,6 +684,65 @@ public:
         }
         dirty.push_back( std::make_pair( nOffset, nBytes ) );
     }
+    void AddRange( std::vector< std::pair< UINT, UINT > > &ranges, UINT offset, UINT bytes )
+    {
+        if ( !bytes || offset >= nSize ) return;
+        UINT end = offset + (std::min)( bytes, nSize - offset );
+        // A sorted union bounds memory independently of the number of draws.
+        auto i = ranges.begin();
+        while ( i != ranges.end() && i->second < offset ) ++i;
+        while ( i != ranges.end() && i->first <= end )
+        {
+            offset = (std::min)( offset, i->first );
+            end = (std::max)( end, i->second );
+            i = ranges.erase( i );
+        }
+        ranges.insert( i, std::make_pair( offset, end ) );
+    }
+    void MarkUsed( UINT offset, UINT bytes ) { AddRange( used, offset, bytes ); }
+    static bool VerificationEnabled()
+    {
+        static const bool enabled = getenv( "A5_D3D_BUFFER_VERIFY" ) != 0;
+        return enabled;
+    }
+    void VerifyContents()
+    {
+        if ( !VerificationEnabled() || nLockCount || initialized.empty() ||
+             g_stats.nPresents % 30 != 0 || lastVerifiedPresent == g_stats.nPresents ) return;
+        lastVerifiedPresent = g_stats.nPresents;
+        // A separate binding avoids disturbing the current vertex/index state.
+        // This read synchronizes the GPU; diagnostic FPS is not a benchmark.
+        GLint previous = 0;
+        glGetIntegerv( GL_COPY_READ_BUFFER_BINDING, &previous );
+        glBindBuffer( GL_COPY_READ_BUFFER, nGL );
+        const uint8_t *p = (const uint8_t *)glMapBufferRange( GL_COPY_READ_BUFFER, 0, nSize, GL_MAP_READ_BIT );
+        if ( p )
+        {
+            for ( const auto &range : initialized )
+            {
+                if ( memcmp( p + range.first, &shadow[ range.first ], range.second - range.first ) == 0 ) continue;
+                UINT offset = range.first;
+                while ( offset < range.second && p[ offset ] == shadow[ offset ] ) ++offset;
+                D3DGL_ERR( "d3d9gles: buffer mismatch at present %d: GL %u target 0x%x, byte %u/%u, GPU %u CPU %u",
+                           g_stats.nPresents, nGL, target, offset, nSize, p[ offset ], shadow[ offset ] );
+                break;
+            }
+            if ( !glUnmapBuffer( GL_COPY_READ_BUFFER ) )
+                D3DGL_ERR( "d3d9gles: buffer verification unmap failed (GL %u)", nGL );
+        }
+        else
+            D3DGL_ERR( "d3d9gles: buffer verification map failed (GL %u, error 0x%x)", nGL, glGetError() );
+        glBindBuffer( GL_COPY_READ_BUFFER, previous );
+    }
+    bool IsInUse( UINT offset, UINT bytes ) const
+    {
+        for ( const auto &range : used )
+        {
+            if ( range.first >= offset + bytes ) break;
+            if ( range.second > offset ) return true;
+        }
+        return false;
+    }
     HRESULT Unlock();
 };
 
@@ -674,8 +751,9 @@ void DeviceUploadBuffer( CBufferBase *pBuffer );
 
 HRESULT CBufferBase::Unlock()
 {
-    if ( nLockCount > 0 )
-        --nLockCount;
+    if ( nLockCount == 0 )
+        return D3DERR_INVALIDCALL;
+    --nLockCount;
     if ( nLockCount == 0 )
         DeviceUploadBuffer( this );
     return D3D_OK;
@@ -818,6 +896,7 @@ int AttribLocation( int nUsage, int nUsageIndex )
 struct SProgram
 {
     GLuint   nGL;
+    int      nDraws = 0;
     /*  Uniform arrays are trimmed by the GLSL compiler to the highest index a
      *  shader actually reads, so a location is looked up per register and
      *  -1 means "this shader does not use it". */
@@ -840,7 +919,10 @@ struct SProgram
 
 struct SProgramKey
 {
-    CVertexShader *pVS; CPixelShader *pPS; int nCubeMask;
+    // Shader wrappers can be released and their addresses reused. The GLSL
+    // table lives for the whole process and identifies the actual program.
+    const A5GlslEntry *pVS, *pPS;
+    int nCubeMask;
     bool operator<( const SProgramKey &o ) const
     {
         if ( pVS != o.pVS ) return pVS < o.pVS;
@@ -942,6 +1024,20 @@ public:
     std::map< SProgramKey, SProgram * > programs;
     SProgram *pCurrentProgram;
     GLuint    nScratchFBO;
+    struct DrawBuffers
+    {
+        GLuint vertex = 0, index = 0;
+        std::vector<unsigned char> vertices;
+        std::vector<uint32_t> indices;
+    };
+    std::vector<DrawBuffers> drawBuffers;
+    size_t nextDrawBuffer = 0;
+    DrawBuffers *activeDrawBuffer = 0;
+    std::vector<uint32_t> streamIndices;
+    struct VertexRemap { uint32_t generation = 0, index = 0; };
+    std::vector<VertexRemap> vertexRemap;
+    std::vector<unsigned char> packedVertices;
+    uint32_t remapGeneration = 0;
     D3DGAMMARAMP gamma;
     bool      bInScene;
 
@@ -982,6 +1078,11 @@ public:
         if ( pVB ) pVB->Release(); if ( pIB ) pIB->Release();
         if ( pRT ) pRT->Release(); if ( pDS ) pDS->Release();
         glDeleteFramebuffers( 1, &nScratchFBO );
+        for ( const auto &buffers : drawBuffers )
+        {
+            if ( buffers.vertex ) glDeleteBuffers( 1, &buffers.vertex );
+            if ( buffers.index ) glDeleteBuffers( 1, &buffers.index );
+        }
         if ( g_pDevice == this )
             g_pDevice = 0;
     }
@@ -1166,6 +1267,9 @@ public:
         {
             src.assign( pszSource, pszNewline + 1 );
             src += pszDefines;
+            // The renderer reuses depth across different lighting shaders
+            // with D3DCMP_EQUAL. Their clip positions must agree bit-for-bit.
+            if ( type == GL_VERTEX_SHADER ) src += "invariant gl_Position;\n";
             src += pszNewline + 1;
         }
         else
@@ -1190,7 +1294,7 @@ public:
     {
         if ( !pVS || !pPS || !pVS->pEntry || !pPS->pEntry )
             return 0;
-        SProgramKey key = { pVS, pPS, nCubeMask };
+        SProgramKey key = { pVS->pEntry, pPS->pEntry, nCubeMask };
         std::map< SProgramKey, SProgram * >::iterator i = programs.find( key );
         if ( i != programs.end() )
             return i->second;
@@ -1270,7 +1374,7 @@ public:
                 nMask |= 1 << s;
         return nMask;
     }
-    void ApplyProgramAndUniforms()
+    bool ApplyProgramAndUniforms()
     {
         SProgram *p = GetProgram( CurrentCubeMask() );
         if ( !p || !p->nGL )
@@ -1281,7 +1385,7 @@ public:
                             pVS ? ( pVS->pEntry ? pVS->pEntry->name : "unknown-asm" ) : "none",
                             pPS ? ( pPS->pEntry ? pPS->pEntry->name : "unknown-asm" ) : "none",
                             (unsigned)dwFVF );
-            return;
+            return false;
         }
         if ( p != pCurrentProgram )
         {
@@ -1328,12 +1432,13 @@ public:
             ApplySampler( s );
             glBindSampler( s, samplers[ s ].nGL );
         }
+        return true;
     }
-    void ApplyVertexLayout( int nBaseVertex )
+    void ApplyVertexLayout( int nBaseVertex, GLuint overrideBuffer = 0 )
     {
         if ( !pVB || !pDecl )
             return;
-        glBindBuffer( GL_ARRAY_BUFFER, pVB->buf.nGL );
+        glBindBuffer( GL_ARRAY_BUFFER, overrideBuffer ? overrideBuffer : pVB->buf.nGL );
         bool used[ 8 ] = { false, false, false, false, false, false, false, false };
         for ( size_t i = 0; i < pDecl->elements.size(); ++i )
         {
@@ -1354,7 +1459,7 @@ public:
                 case D3DDECLTYPE_SHORT4: size = 4; type = GL_SHORT; norm = GL_FALSE; break;
                 default: continue;
             }
-            const size_t nOffset = (size_t)nVBOffset + (size_t)nBaseVertex * nVBStride + e.Offset;
+            const size_t nOffset = ( overrideBuffer ? 0 : (size_t)nVBOffset + (size_t)nBaseVertex * nVBStride ) + e.Offset;
             glVertexAttribPointer( loc, size, type, norm, nVBStride, (const void *)nOffset );
             glEnableVertexAttribArray( loc );
             used[ loc ] = true;
@@ -1381,17 +1486,68 @@ public:
         }
         return false;
     }
-    void PrepareDraw( int nBaseVertex )
+    bool PrepareDraw( int nBaseVertex )
     {
+        if ( pVB ) pVB->buf.VerifyContents();
+        if ( pIB ) pIB->buf.VerifyContents();
         ApplyFramebuffer();
         ApplyRenderStates();
-        ApplyProgramAndUniforms();
+        if ( !ApplyProgramAndUniforms() ) return false;
         ApplyVertexLayout( nBaseVertex );
         if ( g_bCountByShader )
+            ++pCurrentProgram->nDraws;
+        return true;
+    }
+    void StreamVertices( const void *data, UINT bytes )
+    {
+        // Stable scenes reuse the same small draw buffers on the next frame.
+        // Compare contents, not engine NOOVERWRITE hints, before reusing data.
+        // A changed draw uses BufferData's synchronized storage replacement.
+        const size_t slot = nextDrawBuffer++ % 1024;
+        if ( drawBuffers.size() <= slot ) drawBuffers.resize( slot + 1 );
+        DrawBuffers &buffers = drawBuffers[slot];
+        activeDrawBuffer = &buffers;
+        if ( !buffers.vertex ) glGenBuffers( 1, &buffers.vertex );
+        glBindBuffer( GL_ARRAY_BUFFER, buffers.vertex );
+        if ( buffers.vertices.size() != bytes || memcmp( buffers.vertices.data(), data, bytes ) != 0 )
         {
-            std::string key = std::string( pVS && pVS->pEntry ? pVS->pEntry->name : "?" ) + "+" + ( pPS && pPS->pEntry ? pPS->pEntry->name : "?" );
-            ++g_drawsByShader[ key ];
+            glBufferData( GL_ARRAY_BUFFER, bytes, data, GL_STREAM_DRAW );
+            const unsigned char *p = (const unsigned char *)data;
+            buffers.vertices.assign( p, p + bytes );
+            g_stats.nBufferUploadBytes += bytes;
         }
+        ApplyVertexLayout( 0, buffers.vertex );
+    }
+    // Capture one scene frame without changing the normal render path. Each
+    // draw gets a numbered thumbnail, including off-screen lighting passes.
+    void CaptureDraw()
+    {
+        static const int frame = getenv( "A5_D3D_CAPTURE_FRAME" ) ? atoi( getenv( "A5_D3D_CAPTURE_FRAME" ) ) : -1;
+        if ( g_stats.nPresents != frame || !pRT ) return;
+        const char *dir = getenv( "A5_D3D_CAPTURE_DIR" );
+        if ( !dir || !*dir ) return;
+        static int draw = 0;
+        char path[ 1024 ];
+        snprintf( path, sizeof( path ), "%s/frame-%d-draw-%03d.ppm", dir, frame, draw );
+        FILE *file = fopen( path, "wb" );
+        if ( !file ) return;
+        std::vector<unsigned char> rgba( (size_t)nRTWidth * nRTHeight * 4 );
+        glReadPixels( 0, 0, nRTWidth, nRTHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data() );
+        const int step = (std::max)( 1, ( nRTWidth + 255 ) / 256 );
+        const int w = ( nRTWidth + step - 1 ) / step, h = ( nRTHeight + step - 1 ) / step;
+        fprintf( file, "P6\n%d %d\n255\n", w, h );
+        std::vector<unsigned char> rgb( (size_t)w * 3 );
+        for ( int y = 0; y < h; ++y )
+        {
+            for ( int x = 0; x < w; ++x )
+                memcpy( &rgb[x * 3], &rgba[((size_t)y * step * nRTWidth + x * step) * 4], 3 );
+            fwrite( rgb.data(), 1, rgb.size(), file );
+        }
+        fclose( file );
+        D3DGL_LOG( "capture: draw %03d rt %u %dx%d vs %s ps %s blend %d(%d,%d) z %d write %d", draw++,
+                   nCurrentFBO, nRTWidth, nRTHeight,
+                   pVS->pEntry->name, pPS->pEntry->name, (int)rs.alphaBlend,
+                   (int)rs.srcBlend, (int)rs.dstBlend, (int)rs.zEnable, (int)rs.zWrite );
     }
     /*  A5_D3D_TRACE=<n>: log every draw of the first n Present()s. */
     void TraceDraw( const char *pszKind, D3DPRIMITIVETYPE type, UINT nPrims, UINT nStart )
@@ -1500,9 +1656,11 @@ public:
          * bottom, so the blit flips vertically. */
         glBlitFramebuffer( 0, 0, pp.BackBufferWidth, pp.BackBufferHeight,
                            dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR );
+        CheckGLError( "Present" );
         if ( g_hooks.present )
             g_hooks.present();
         ++g_stats.nPresents;
+        nextDrawBuffer = 0;
         bFramebufferDirty = true;
         bStatesDirty = true;
         return D3D_OK;
@@ -1835,8 +1993,11 @@ public:
     {
         for ( UINT i = 0; i < Vector4fCount && StartRegister + i < 96; ++i )
         {
-            memcpy( vsConst[ StartRegister + i ], pConstantData + i * 4, 16 );
-            vsGen[ StartRegister + i ] = ++nGenCounter;
+            if ( memcmp( vsConst[ StartRegister + i ], pConstantData + i * 4, 16 ) != 0 )
+            {
+                memcpy( vsConst[ StartRegister + i ], pConstantData + i * 4, 16 );
+                vsGen[ StartRegister + i ] = ++nGenCounter;
+            }
         }
         return D3D_OK;
     }
@@ -1844,8 +2005,11 @@ public:
     {
         for ( UINT i = 0; i < Vector4fCount && StartRegister + i < 8; ++i )
         {
-            memcpy( psConst[ StartRegister + i ], pConstantData + i * 4, 16 );
-            psGen[ StartRegister + i ] = ++nGenCounter;
+            if ( memcmp( psConst[ StartRegister + i ], pConstantData + i * 4, 16 ) != 0 )
+            {
+                memcpy( psConst[ StartRegister + i ], pConstantData + i * 4, 16 );
+                psGen[ StartRegister + i ] = ++nGenCounter;
+            }
         }
         return D3D_OK;
     }
@@ -1870,7 +2034,7 @@ public:
     {
         ++g_stats.nDraws;
         if ( SkipDraw() ) return D3D_OK;
-        PrepareDraw( 0 );
+        if ( !PrepareDraw( 0 ) ) return D3DERR_INVALIDCALL;
         TraceDraw( "DrawPrimitive", PrimitiveType, PrimitiveCount, StartVertex );
         GLenum mode; GLsizei count;
         switch ( PrimitiveType )
@@ -1880,7 +2044,17 @@ public:
             case D3DPT_TRIANGLESTRIP: mode = GL_TRIANGLE_STRIP; count = PrimitiveCount + 2; break;
             default: mode = GL_TRIANGLES; count = PrimitiveCount * 3; break;
         }
-        glDrawArrays( mode, (GLint)StartVertex, count );
+        if ( !pVB || !nVBStride || count < 0 ||
+             (uint64_t)nVBOffset + ( (uint64_t)StartVertex + count ) * nVBStride > pVB->buf.nSize )
+            return D3DERR_INVALIDCALL;
+        if ( StreamDrawBuffers() && count )
+        {
+            StreamVertices( &pVB->buf.shadow[nVBOffset + StartVertex * nVBStride], count * nVBStride );
+            glDrawArrays( mode, 0, count );
+        }
+        else glDrawArrays( mode, (GLint)StartVertex, count );
+        CaptureDraw();
+        pVB->buf.MarkUsed( nVBOffset + StartVertex * nVBStride, count * nVBStride );
         return D3D_OK;
     }
     virtual HRESULT DrawIndexedPrimitive( D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT, UINT, UINT StartIndex, UINT PrimitiveCount )
@@ -1889,7 +2063,7 @@ public:
             return D3DERR_INVALIDCALL;
         ++g_stats.nDraws;
         if ( SkipDraw() ) return D3D_OK;
-        PrepareDraw( BaseVertexIndex );
+        if ( !PrepareDraw( BaseVertexIndex ) ) return D3DERR_INVALIDCALL;
         TraceDraw( "DrawIndexedPrimitive", PrimitiveType, PrimitiveCount, StartIndex );
         glBindBuffer( GL_ELEMENT_ARRAY_BUFFER, pIB->buf.nGL );
         GLenum mode; GLsizei count;
@@ -1900,7 +2074,88 @@ public:
             case D3DPT_TRIANGLESTRIP: mode = GL_TRIANGLE_STRIP; count = PrimitiveCount + 2; break;
             default: mode = GL_TRIANGLES; count = PrimitiveCount * 3; break;
         }
-        glDrawElements( mode, count, pIB->indexType, (const void *)( (size_t)StartIndex * pIB->nIndexSize ) );
+        if ( !pVB || !nVBStride || count < 0 ||
+             (uint64_t)StartIndex + count > pIB->buf.nSize / pIB->nIndexSize )
+            return D3DERR_INVALIDCALL;
+        UINT minIndex = UINT_MAX, maxIndex = 0;
+        if ( count > 0 )
+        {
+            for ( GLsizei i = 0; i < count; ++i )
+            {
+                UINT index;
+                if ( pIB->nIndexSize == 2 )
+                    index = ( (const uint16_t *)&pIB->buf.shadow[ 0 ] )[ StartIndex + i ];
+                else
+                    index = ( (const uint32_t *)&pIB->buf.shadow[ 0 ] )[ StartIndex + i ];
+                minIndex = (std::min)( minIndex, index );
+                maxIndex = (std::max)( maxIndex, index );
+            }
+            if ( (int64_t)BaseVertexIndex + minIndex < 0 ||
+                 (int64_t)nVBOffset + ( (int64_t)BaseVertexIndex + maxIndex + 1 ) * nVBStride > pVB->buf.nSize )
+            {
+                static int warnings = 0;
+                if ( ++warnings <= 8 )
+                    D3DGL_ERR( "d3d9gles: out-of-range vertex indices %u..%u base %d, stride %u, buffer %u bytes",
+                               minIndex, maxIndex, BaseVertexIndex, nVBStride, pVB->buf.nSize );
+                return D3DERR_INVALIDCALL;
+            }
+            pVB->buf.MarkUsed( nVBOffset + ( BaseVertexIndex + minIndex ) * nVBStride,
+                              ( maxIndex - minIndex + 1 ) * nVBStride );
+        }
+        if ( StreamDrawBuffers() && count )
+        {
+            streamIndices.resize( count );
+            const UINT span = maxIndex - minIndex + 1;
+            // Batches can reference distant allocations in the 16 MiB pool.
+            // Upload their actual vertices rather than all gaps between them.
+            const bool pack = span > (UINT)count * 2;
+            UINT unique = 0;
+            if ( pack )
+            {
+                if ( vertexRemap.size() < span ) vertexRemap.resize( span );
+                if ( ++remapGeneration == 0 )
+                {
+                    for ( auto &entry : vertexRemap ) entry.generation = 0;
+                    ++remapGeneration;
+                }
+                packedVertices.resize( (size_t)count * nVBStride );
+            }
+            for ( GLsizei i = 0; i < count; ++i )
+            {
+                const UINT index = ( pIB->nIndexSize == 2
+                    ? ((const uint16_t *)pIB->buf.shadow.data())[StartIndex + i]
+                    : ((const uint32_t *)pIB->buf.shadow.data())[StartIndex + i] ) - minIndex;
+                if ( pack )
+                {
+                    VertexRemap &entry = vertexRemap[index];
+                    if ( entry.generation != remapGeneration )
+                    {
+                        entry.generation = remapGeneration;
+                        entry.index = unique++;
+                        memcpy( &packedVertices[(size_t)entry.index * nVBStride],
+                                &pVB->buf.shadow[nVBOffset + ( BaseVertexIndex + minIndex + index ) * nVBStride], nVBStride );
+                    }
+                    streamIndices[i] = entry.index;
+                }
+                else streamIndices[i] = index;
+            }
+            StreamVertices( pack ? packedVertices.data()
+                                 : &pVB->buf.shadow[nVBOffset + ( BaseVertexIndex + minIndex ) * nVBStride],
+                            ( pack ? unique : span ) * nVBStride );
+            DrawBuffers &buffers = *activeDrawBuffer;
+            if ( !buffers.index ) glGenBuffers( 1, &buffers.index );
+            glBindBuffer( GL_ELEMENT_ARRAY_BUFFER, buffers.index );
+            if ( buffers.indices != streamIndices )
+            {
+                glBufferData( GL_ELEMENT_ARRAY_BUFFER, count * sizeof(uint32_t), streamIndices.data(), GL_STREAM_DRAW );
+                buffers.indices = streamIndices;
+                g_stats.nBufferUploadBytes += count * sizeof(uint32_t);
+            }
+            glDrawElements( mode, count, GL_UNSIGNED_INT, 0 );
+        }
+        else glDrawElements( mode, count, pIB->indexType, (const void *)( (size_t)StartIndex * pIB->nIndexSize ) );
+        CaptureDraw();
+        pIB->buf.MarkUsed( StartIndex * pIB->nIndexSize, count * pIB->nIndexSize );
         return D3D_OK;
     }
 };
@@ -1914,18 +2169,76 @@ void DeviceForgetSurface( CSurface *pSurface )
 
 void DeviceUploadBuffer( CBufferBase *pBuffer )
 {
-    if ( pBuffer->dirty.empty() && !pBuffer->bDiscardPending )
+    if ( StreamDrawBuffers() )
+    {
+        pBuffer->bDiscardPending = false;
+        pBuffer->dirty.clear();
         return;
+    }
     glBindBuffer( pBuffer->target, pBuffer->nGL );
     if ( pBuffer->bDiscardPending )
     {
         /* D3DLOCK_DISCARD: orphan, so the driver need not wait for in-flight draws */
         glBufferData( pBuffer->target, pBuffer->nSize, 0, GL_DYNAMIC_DRAW );
         pBuffer->bDiscardPending = false;
+        pBuffer->used.clear();
+        pBuffer->initialized.clear();
+    }
+    // GfxBuffers also uses an ordinary empty lock/unlock to wait before
+    // recycling an in-flight allocation. Preserve that barrier: a later
+    // NOOVERWRITE update relies on it being safe to reuse the range.
+    if ( pBuffer->dirty.empty() && !pBuffer->bNoOverwrite && pBuffer->nSize )
+    {
+        void *p = glMapBufferRange( pBuffer->target, 0, pBuffer->nSize, GL_MAP_READ_BIT );
+        if ( p ) glUnmapBuffer( pBuffer->target );
+        else { CheckGLError( "buffer wait mapping" ); glFinish(); }
+        pBuffer->used.clear();
     }
     for ( size_t i = 0; i < pBuffer->dirty.size(); ++i )
-        glBufferSubData( pBuffer->target, pBuffer->dirty[ i ].first, pBuffer->dirty[ i ].second,
-                         &pBuffer->shadow[ pBuffer->dirty[ i ].first ] );
+    {
+        const UINT offset = pBuffer->dirty[ i ].first, bytes = pBuffer->dirty[ i ].second;
+        g_stats.nBufferUploadBytes += bytes;
+        // Opt in while the mapped path is under scene-level validation.
+        // The old path is slow on Adreno, but remains the visual baseline.
+        static const bool useSubData = getenv( "A5_D3D_BUFFER_MAP" ) == 0;
+        if ( useSubData )
+        {
+            glBufferSubData( pBuffer->target, offset, bytes, &pBuffer->shadow[ offset ] );
+            continue;
+        }
+        // SubData made Adreno rename/copy the entire large vertex pool for
+        // each tiny UI append. D3D's NOOVERWRITE promise allows us to write
+        // only the unused range without waiting or copying the whole pool.
+        // The old engine occasionally reuses NOOVERWRITE ranges still used
+        // by draws. Track actual draw ranges instead of trusting that flag.
+        const bool unsynchronized = pBuffer->bNoOverwrite && !pBuffer->IsInUse( offset, bytes );
+        const GLbitfield access = GL_MAP_WRITE_BIT | ( unsynchronized ? GL_MAP_UNSYNCHRONIZED_BIT : 0 );
+        void *p = glMapBufferRange( pBuffer->target, offset, bytes, access );
+        if ( p )
+        {
+            // A synchronized range map only retires hazards for that range.
+            // Other regions can still be in flight. Keep their conservative
+            // union until the entire store is orphaned or explicitly waited.
+            memcpy( p, &pBuffer->shadow[ offset ], bytes );
+            if ( !glUnmapBuffer( pBuffer->target ) )
+            {
+                // A failed unmap invalidates the whole store, not just this
+                // range. Restore it from the CPU shadow before the next draw.
+                D3DGL_WARN( "d3d9gles: restoring buffer after failed unmap" );
+                glBufferData( pBuffer->target, pBuffer->nSize, &pBuffer->shadow[ 0 ], GL_DYNAMIC_DRAW );
+                pBuffer->used.clear();
+                break;
+            }
+        }
+        else
+        {
+            CheckGLError( "buffer upload mapping" );
+            glBufferSubData( pBuffer->target, offset, bytes, &pBuffer->shadow[ offset ] );
+        }
+    }
+    if ( CBufferBase::VerificationEnabled() )
+        for ( const auto &range : pBuffer->dirty )
+            pBuffer->AddRange( pBuffer->initialized, range.first, range.second );
     pBuffer->dirty.clear();
     /* the device's array/element bindings are re-established at the next draw */
 }
@@ -2068,8 +2381,17 @@ const char *A5D3DDrawsByShader( int bReset )
 {
     static std::string szOut;
     g_bCountByShader = true;
+    // Aggregate names only when logging, not by allocating strings per draw.
+    std::map< std::string, int > drawsByShader;
+    if ( g_pDevice )
+        for ( const auto &entry : g_pDevice->programs )
+        {
+            if ( entry.second->nDraws )
+                drawsByShader[ std::string( entry.first.pVS->name ) + "+" + entry.first.pPS->name ] += entry.second->nDraws;
+            if ( bReset ) entry.second->nDraws = 0;
+        }
     std::vector< std::pair< int, std::string > > v;
-    for ( std::map< std::string, int >::const_iterator i = g_drawsByShader.begin(); i != g_drawsByShader.end(); ++i )
+    for ( std::map< std::string, int >::const_iterator i = drawsByShader.begin(); i != drawsByShader.end(); ++i )
         v.push_back( std::make_pair( -i->second, i->first ) );
     std::sort( v.begin(), v.end() );
     szOut.clear();
@@ -2079,8 +2401,6 @@ const char *A5D3DDrawsByShader( int bReset )
         snprintf( b, sizeof( b ), "%s%s:%d", i ? " " : "", v[ i ].second.c_str(), -v[ i ].first );
         szOut += b;
     }
-    if ( bReset )
-        g_drawsByShader.clear();
     return szOut.c_str();
 }
 
