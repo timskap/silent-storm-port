@@ -196,24 +196,41 @@ path. The input worker is now started, acknowledges Android events promptly,
 and queues copies for the game thread. A staged native-app-glue hook switches
 queues before Android can destroy the old queue; it does not patch the SDK.
 
-**Renderer optimisation is still under validation.** After the BSP fix the
-paused mission was approximately 3.6–4 FPS: Adreno spent most of the frame in
-full-buffer copies/allocation for small HUD updates. Mapped range uploads reached
-about 30 FPS, but early variants corrupted the scene despite passing small
-shader tests. They are not an accepted gameplay result. The current candidate
-tracks referenced vertex/index ranges, conservatively retains outstanding
-regions after a partial synchronized map, and validates index bounds. It is
-opt-in with `A5_D3D_BUFFER_MAP=1` in `env.txt`; the default retains the original
-upload path until the mission passes a sustained visual/input/resume check.
-Do not remove the opt-in gate based solely on FPS or the boot harness.
+**Compact draw buffers are now the default.** After the BSP fix the mission
+was approximately 3.6–4 FPS: Adreno spent most of the frame copying/allocating
+the 16 MiB pool for tiny HUD updates. Mapped uploads reached 30 FPS but corrupted
+the scene during sustained play. They remain a diagnostic option only.
+The default now uploads the vertices actually referenced by each draw, packs
+sparse indices, and reuses up to 1,024 small vertex/index buffer pairs across
+frames. Contents are compared before reuse; changed buffers use synchronized
+storage replacement. The shader-program cache keys immutable shader entries,
+and vertex programs declare position invariance for EQUAL-depth multipass draws.
 
-The expanded device harness passes 48 checks (including appends to a 16 MiB
-vertex pool, overlapping updates, and missing-program rejection), with two
+At camera `(18.62,25.77,0), rod=25.2` in `template 4414`, the visible buildings
+and terrain held 30.0 FPS, p95 approximately 33.7 ms, with 12–15 ms average game
+thread work and no GL errors. Moving through other building views measured
+28.5–30 FPS with occasional 50–75 ms frames: this is improved, but not a claim
+of locked 30 FPS everywhere. Rule set 25 caches loose-asset existence for the
+current resource mount: profiling found repeated scans for missing model parts
+in portrait updates. The cache clears on mount changes and resource reload.
+
+The apparent permanent PAUSE label was a retail UI binding mismatch, not the
+simulation state: control 2729 is text, while this snapshot requested an image.
+Rule set 24 binds it as a window. Scene tracing confirms unpaused gameplay and
+camera movement. The user also confirms substantially fewer rendering defects.
+Black-and-white terrain tiles are missing software textures 6151 and 6166 in
+this data set. The loader now tries the alternate compressed/uncompressed ID
+and low-resolution assets, then uses the database average colour for missing
+files. This does not restore the absent artwork; malformed/unsupported files
+still produce diagnostics.
+
+The expanded device harness passes 51 checks, including sparse 16/32-bit
+indices, negative base vertices, stream offsets, reuse across Present, changed
+geometry, shader wrapper lifetimes, and EQUAL-depth multipass pixels, with two
 existing data/UI warnings. Host checks pass (38 checks plus CTest's frame
 schedule and BSP-cache regressions). ARM64 full-game and ARMv7 harness builds
-compile. Final scene validation of the latest candidate was interrupted when
-Android returned to the PIN screen; unpaused gameplay and background/return
-remain to be checked on the unlocked device.
+compile. A full campaign, all maps, and true GPU context-loss recovery remain
+outside this validation.
 
 Three bugs found on the way that were invisible before and affect *everything*
 (details in Traps): DB cross-references imported from a file where the target

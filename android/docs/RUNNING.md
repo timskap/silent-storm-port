@@ -72,7 +72,7 @@ adb logcat -s SilentStorm
 The game targets 30 FPS using display-vsync callbacks; it stops stepping while
 paused by Android or without window focus. Every five seconds, `perf:` reports
 observed FPS, frame-interval p95/max, game-thread wall time (excluding swap), swap time,
-draws, missing-program draws, and GL errors. A load is included in these timings;
+draws, missing-program draws, GL errors, and buffer uploads in MiB/frame. A load is included in these timings;
 measure steady play separately from startup. The first window also contains the
 self-test's two deliberately rejected missing-shader draws.
 
@@ -83,10 +83,19 @@ FPS while a lock screen or screensaver owns focus is not a gameplay measurement.
 Check camera movement, unpaused play, and background/return as well as a still
 frame. A passing shader test does not establish correctness of the whole scene.
 
-`A5_D3D_BUFFER_MAP=1` opts into the candidate mapped-buffer optimisation. It is
-not enabled by default: earlier variants reached the frame-rate target but
-failed sustained visual checks. See [PORTING.md](PORTING.md) for validation
-status. Remove this variable to use the original buffer-upload path.
+Compact, cached draw buffers are enabled by default. For driver diagnosis,
+`A5_D3D_BUFFER_STREAM=0` selects the original buffer-upload path, while
+`A5_D3D_BUFFER_MAP=1` selects experimental mapped uploads when STREAM is unset.
+An explicit `A5_D3D_BUFFER_STREAM=1` takes precedence. Mapped uploads failed
+sustained scene checks; use the default for play. See [PORTING.md](PORTING.md)
+for measured performance and remaining limits.
+
+`A5_SCENE_TRACE=1` logs the actual pause state and camera placement.
+`A5_CAMERA_POS=x,y,z,rod,pitch,yaw` sets one initial mission view for repeatable
+measurements. Remove these test overrides afterwards. For render diagnosis,
+`A5_D3D_CAPTURE_FRAME=N` with `A5_D3D_CAPTURE_DIR=<app-writable directory>` dumps
+one frame's draw results as PPM thumbnails; exclude that readback frame from
+performance measurements.
 
 ## Running without a device
 

@@ -35,7 +35,12 @@ static A5D3DFrameStats g_stats;
 static bool g_bCountByShader = false;
 static bool StreamDrawBuffers()
 {
-    static const bool enabled = getenv( "A5_D3D_BUFFER_STREAM" ) != 0;
+    // Upload compact draw geometry by default. Keep the old paths available
+    // for driver comparisons; an explicit STREAM setting takes precedence.
+    static const bool enabled = [] {
+        const char *stream = getenv( "A5_D3D_BUFFER_STREAM" );
+        return stream ? strcmp( stream, "0" ) != 0 : getenv( "A5_D3D_BUFFER_MAP" ) == 0;
+    }();
     return enabled;
 }
 #define D3DGL_LOG( ... )  a5_log( A5_PRIORITY_INFO,  __VA_ARGS__ )

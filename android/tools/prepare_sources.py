@@ -4636,6 +4636,114 @@ RULES += [
 ]
 
 
+# Rule set 25: avoid repeated loose-asset directory scans and load the available
+# texture variant/average colour for the software terrain compositor, as GTexture does.
+RULES += [
+    (
+        "Main/GResource.cpp",
+        "Cache loose-asset existence for the current resource mount.",
+        "static string szDir;",
+        "static string szDir;\nstatic hash_map<string, bool> looseFileExists; // [android] guarded by packageWork",
+    ),
+    (
+        "Main/GResource.cpp",
+        "Invalidate existence results when the resource mount changes.",
+        "\tszDir = pszName;",
+        "\tlooseFileExists.clear();\n\tszDir = pszName;",
+    ),
+    (
+        "Main/GResource.cpp",
+        "Invalidate cached missing assets on resource reload as well.",
+        "\tpackages.clear();",
+        "\tpackages.clear();\n\tlooseFileExists.clear();",
+    ),
+    (
+        "Main/GResource.cpp",
+        "Reuse loose-file lookups instead of scanning a large missing-part directory every portrait frame.",
+        "// CFileResource\n",
+        '''// CFileResource
+static bool DoesLooseFileExist( const string &name )
+{
+    hash_map<string, bool>::const_iterator i = looseFileExists.find( name );
+    if ( i != looseFileExists.end() ) return i->second;
+    const bool exists = a5_stat_exists( name.c_str() ) != 0;
+    looseFileExists[name] = exists;
+    return exists;
+}
+''',
+    ),
+    (
+        "Main/GResource.cpp",
+        "Cache direct-ID existence queries under the caller's packageWork lock.",
+        "return a5_stat_exists( GetFileResourceName( pszResName, nID ).c_str() ) != 0;",
+        "return DoesLooseFileExist( GetFileResourceName( pszResName, nID ) );",
+    ),
+    (
+        "Main/GResource.cpp",
+        "Cache geometry-part existence queries under the caller's packageWork lock.",
+        "return a5_stat_exists( GetFileResourceName( pszResName, GetID( key ) ).c_str() ) != 0;",
+        "return DoesLooseFileExist( GetFileResourceName( pszResName, GetID( key ) ) );",
+    ),
+    (
+        "Main/SWTexture.cpp",
+        "Try both texture variants, then low-resolution assets, before the software fallback.",
+        '\tpRequest = new CFileRequest( "Textures", GetKey() );',
+        '''    int fileID = GetKey();
+    const char *resourceName = "Textures";
+    if ( !CResourceFileOpener::DoesExist( resourceName, fileID ) )
+    {
+        if ( CResourceFileOpener::DoesExist( resourceName, fileID ^ 0x01000000 ) )
+            fileID ^= 0x01000000;
+        else if ( CResourceFileOpener::DoesExist( "LRTextures", fileID ) )
+            resourceName = "LRTextures";
+        else if ( CResourceFileOpener::DoesExist( "LRTextures", fileID ^ 0x01000000 ) )
+        {
+            resourceName = "LRTextures";
+            fileID ^= 0x01000000;
+        }
+        if ( fileID != GetKey() || resourceName[0] == 'L' )
+            DebugTrace( "[android] software texture %d: using %s/%d\\n", GetKey(), resourceName, fileID );
+    }
+    pRequest = new CFileRequest( resourceName, fileID );''',
+    ),
+    (
+        "Main/SWTexture.cpp",
+        "Read the authored average colour for missing terrain assets.",
+        '#include "SWTexture.h"',
+        '#include "SWTexture.h"\n#include "../DBFormat/DataFormat.h"',
+    ),
+    (
+        "Main/SWTexture.cpp",
+        "Missing terrain files use their database colour instead of a black-and-white checkerboard.",
+        '\t\tCFileRequest &file = *pRequest;\n\t\tSMMPFileHeader hdr;',
+        '''        CFileRequest &file = *pRequest;
+        if ( file->GetSize() == 0 )
+        {
+            NDb::CTexture *texture = NDb::GetTexture( GetKey() & ~0x01000000 );
+            if ( texture )
+            {
+                // Preserve the old fallback's dimensions for terrain tile mapping.
+                pValue->mips.resize( 1 );
+                pValue->mips[0].SetSizes( 128, 128 );
+                for ( int y = 0; y < 128; ++y )
+                    for ( int x = 0; x < 128; ++x )
+                        pValue->mips[0][y][x].color = texture->dwAverageColor;
+                DebugTrace( "[android] software texture %d: asset missing - database colour 0x%08X\\n",
+                            GetKey(), (unsigned)texture->dwAverageColor );
+                return;
+            }
+        }
+        SMMPFileHeader hdr;''',
+    ),
+    (
+        "Main/SWTexture.cpp",
+        "Log the resource ID behind a software terrain checkerboard.",
+        '\tcatch(...)\n\t{\n\t\tCreateChecker( pValue );',
+        '\tcatch(...)\n\t{\n\t\tDebugTrace( "[android] software texture %d: missing or truncated - checkerboard\\n", GetKey() );\n\t\tCreateChecker( pValue );',
+    ),
+]
+
+
 def apply_rules(text, rel_path, applied, unmatched):
     """Apply every rule whose file pattern matches.
 

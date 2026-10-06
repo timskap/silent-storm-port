@@ -309,6 +309,64 @@ void RunD3DSelfTest( void *pReporter, ReportFn pfnAdd )
            "overlapping NOOVERWRITE preserves the prior draw when reusing its data" );
     }
     pShot->UnlockRect();
+    // Real batches reference distant allocations, with an offset stream and
+    // sometimes a negative base vertex. Check pixels across Present: unchanged
+    // geometry, changed vertices, then changed indices in the same draw slot.
+    bool bSparseFramesOK = true;
+    for ( int wide = 0; wide < 2; ++wide )
+    {
+        const UINT indices[2][3] = { { 2, 100, wide ? 70000u : 32768u },
+                                    { 4, 102, wide ? 70002u : 32770u } };
+        IDirect3DIndexBuffer9 *pSparseIB = 0;
+        pDev->CreateIndexBuffer( 3 * ( wide ? 4 : 2 ), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                                wide ? D3DFMT_INDEX32 : D3DFMT_INDEX16, D3DPOOL_DEFAULT, &pSparseIB, 0 );
+        pDev->SetStreamSource( 0, pStreamVB, 2 * sizeof( SVec ), sizeof( SVec ) );
+        pDev->SetIndices( pSparseIB );
+        pDev->SetVertexShaderConstantF( 16, c16, 1 );
+        for ( int frame = 0; frame < 4; ++frame )
+        {
+            bSparseFramesOK &= pDev->Present( 0, 0, 0, 0 ) == D3D_OK;
+            if ( frame == 0 || frame == 2 )
+            {
+                for ( int half = 0; half < 2; ++half )
+                    for ( int vertex = 0; vertex < 3; ++vertex )
+                    {
+                        void *p = 0;
+                        // Offset of two vertices cancels BaseVertexIndex=-2.
+                        pStreamVB->Lock( indices[half][vertex] * sizeof( SVec ), sizeof( SVec ), &p, 0 );
+                        SVec v = {};
+                        v.x = ( vertex == 1 ? -0.1f : -0.9f ) + ( frame == 2 && half == 0 ? 1 : 0 );
+                        v.y = vertex == 2 ? -0.1f : -0.9f;
+                        memcpy( p, &v, sizeof( v ) );
+                        pStreamVB->Unlock();
+                    }
+            }
+            if ( frame == 0 || frame == 3 )
+            {
+                void *p = 0;
+                pSparseIB->Lock( 0, 0, &p, D3DLOCK_DISCARD );
+                for ( int i = 0; i < 3; ++i )
+                    if ( wide ) ((uint32_t *)p)[i] = indices[frame == 3][i];
+                    else ((uint16_t *)p)[i] = indices[frame == 3][i];
+                pSparseIB->Unlock();
+            }
+            pDev->Clear( 0, 0, D3DCLEAR_TARGET, 0xFF000000, 1, 0 );
+            bSparseFramesOK &= pDev->DrawIndexedPrimitive( D3DPT_TRIANGLELIST, -2, 2,
+                                                          indices[1][2], 0, 1 ) == D3D_OK;
+            pDev->GetFrontBufferData( 0, pShot );
+            pShot->LockRect( &lr, 0, D3DLOCK_READONLY );
+            const unsigned char *left = (const unsigned char *)lr.pBits + 230 * lr.Pitch + 25 * 4;
+            const unsigned char *right = left + 128 * 4;
+            const unsigned char *lit = frame == 2 ? right : left;
+            const unsigned char *dark = frame == 2 ? left : right;
+            bSparseFramesOK &= lit[0] > 190 && lit[1] > 90 && lit[2] > 40 && lit[2] < 65;
+            bSparseFramesOK &= dark[0] < 15 && dark[1] < 15 && dark[2] < 15;
+            pShot->UnlockRect();
+        }
+        pSparseIB->Release();
+    }
+    R( bSparseFramesOK && glGetError() == GL_NO_ERROR ? BOOT_OK : BOOT_FAIL,
+       "sparse 16/32-bit indices and offset/base vertices survive frame reuse and geometry changes" );
     pDev->SetStreamSource( 0, pVB, 0, sizeof( SVec ) );
     pDev->SetIndices( pIB );
     pDev->SetVertexShaderConstantF( 16, c16, 1 );
