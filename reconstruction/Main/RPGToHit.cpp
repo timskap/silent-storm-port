@@ -1,0 +1,913 @@
+#include "StdAfx.h"
+#include "rpgPerkConstants.h"
+
+#include "aiUnit.h"
+#include "aiPosition.h"
+
+#include "..\DBFormat\DataRPG.h"
+#include "..\DBFormat\DataMap.h"   // NDb::DS_ALLY -- retail aura diplomacy gate
+
+#include "RPGGame.h"
+#include "RPGUnit.h"
+#include "RPGItem.h"
+#include "RPGItemSet.h"
+#include "RPGItemInfo.h"
+#include "RPGUnitMission.h"
+
+#include "..\MiscDll\LogStream.h"
+
+#include "math.h"
+
+#include "wOSBase.h"
+#include "wUnitServer.h"
+#include "rpgGlobal.h"   // CGlobalGame::pDifficulty -- the called-shots gate (bHeadshotShouldKill)
+#include "wMain.h"       // NWorld::CWorld::GetAIMap -- SelectTargetHLs @0x2b49e0
+#include "aiMap.h"       // NAI::IAIMap::GetAccessibleUnitHL / GetHull -- SelectTargetHLs @0x2b49e0
+#include "..\Misc\RandomGen.h"   // SRand -- the SelectTargetHLs HL_ANY roll @0x2b4a7b
+//
+#include "RPGToHit.h"
+#include "RPGBullet.h"
+//
+namespace NRPG
+{
+using NWorld::CUnitServer;
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int GetBulletToHit( const SAttackRayInfo &rayInfo, CObjectBase *pTarget, NAI::EHitLocation hl )
+{
+	// v1.2 0x6b5880: fragments without a shooter and non-unit obstacles always hit.
+	if ( !IsValid( rayInfo.pUS ) )
+		return 100;
+	CDynamicCast<CUnitServer> pUnit( pTarget );
+	if ( !pUnit )
+		return 100;
+	CUnitServer *pShooter = rayInfo.pUS;
+	bool bNight = pShooter->GetWorld()->GetGame()->IsNight();
+	pShooter->GetUnitRPG()->PrintLog( false );
+	int nDistance = int( fabs( rayInfo.vOrigin - pUnit->GetPosition().GetCP() ) * FP_INV_GRID_STEP );
+	vector<int> accessibleHLs;
+	// v1.2 tests direct visibility only (v1.1 also tested audibility).
+	bool bBackstab = !pUnit->IsUnitVisible( pShooter );
+	return GetToHit( pShooter, rayInfo.from.GetPose(), nDistance, rayInfo.vOrigin,
+		pUnit->GetPosition().pos, hl, rayInfo.nExtraAP, pUnit, accessibleHLs, 75,
+		rayInfo.bFirstTurn, CVec3(1,1,1), bBackstab, rayInfo.nBullet, bNight );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CheckBulletToHit( const SAttackRayInfo &rayInfo, CObjectBase *pTarget, NAI::EHitLocation hl )
+{
+	int nToHit = GetBulletToHit( rayInfo, pTarget, hl );
+	return random.Get( 100 ) <= nToHit; // retail 0x6b5aeb: inclusive, even at zero chance
+}
+//
+inline float DistanceFunc( int nDistInTile, float fSlope )
+{
+	return ( (fSlope + 1.f) * 100.f ) / ( float(nDistInTile) + fSlope );
+}
+inline float Cos3DistanceFunc( int nDistInTile, float fSlope )
+{
+	return 100.f * pow( cos( float(nDistInTile) / fSlope ), 3 ) + 2;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// SelectTargetHLs
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail @0x2b49e0 (disasm-decoded; Ghidra's arg matching on the __fastcall was scrambled):
+//   pInfo->eHL = eHL;  pInfo->accessibleHLs freed+zeroed;           // retail frees the buffer;
+//                                                                   // clear() is behavior-identical
+//   if ( GetToHitType( pUS ) != TH_MELEE ) return true;             // non-melee: eHL only, empty set
+//   aimap->GetAccessibleUnitHL( &pInfo->accessibleHLs, pos.GetCenter(), hull(pTarget), F_MELEE_DISTANCE );
+//   if ( empty ) return false;                                      // nothing reachable to strike
+//   if ( eHL == HL_ANY ) { SRand rnd; rnd.Get( size ); return true; }         // see ORIGINAL BUG below
+//   if ( eHL is in the set ) { set = {eHL}; }                       // a reachable called shot narrows it
+//   return true;                                                    // (an UNreachable called shot keeps
+//                                                                   //  the full set AND the called eHL)
+bool SelectTargetHLs( NWorld::CUnitServer *pUS, const NAI::SUnitPosition &pos, STargetHLInfo *pInfo,
+	NWorld::CUnitServer *pTarget, NAI::EHitLocation eHL )
+{
+	pInfo->eHL = eHL;
+	pInfo->accessibleHLs.clear();
+	if ( GetToHitType( pUS ) != TH_MELEE )
+		return true;
+	//
+	NAI::IAIMap *pAIMap = pUS->GetWorld()->GetAIMap();
+	pAIMap->GetAccessibleUnitHL( &pInfo->accessibleHLs, pos.GetCenter(), pAIMap->GetHull( pTarget ), F_MELEE_DISTANCE );
+	if ( pInfo->accessibleHLs.empty() )
+		return false;
+	//
+	if ( NAI::HL_ANY == eHL )
+	{
+		// ORIGINAL BUG (confirmed disasm @0x2b4a7b..0x2b4a9f): the release rolls the random index but
+		// DISCARDS it -- no store to pInfo->eHL follows SRand::Get (the Jan03 Start assigned
+		// eHL = hls[rnd.Get(hls.size())]; the release evidently assigned the dead by-value parameter, so
+		// MSVC kept only the calls). Net retail behavior: an HL_ANY swing STAYS HL_ANY -- the aim point
+		// becomes the target hull's bound center (GetUnitHLPos(-1)) and the to-hit keeps the full
+		// accessible set (GetMeleeToHit: HL penalty from the set, headshot weighting 1.0 for HL_ANY).
+		// Reproduced 1:1, including the burned RNG state.
+		SRand rnd;
+		rnd.Get( pInfo->accessibleHLs.size() );
+		return true;
+	}
+	if ( find( pInfo->accessibleHLs.begin(), pInfo->accessibleHLs.end(), eHL ) != pInfo->accessibleHLs.end() )
+	{
+		pInfo->accessibleHLs.clear();
+		pInfo->accessibleHLs.push_back( eHL );
+	}
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Release-new free helpers (RVA 0x2b6ca0 / 0x2b6d50) -- fully recovered from .rdata, no hooks.
+// GetHeadshotMultiplier weights the cover/area factor (and the thrown-blade result) for a called shot
+// at a specific body part. GetThrowToHitPenalty is the alternative malus when called shots are
+// DISABLED. Values confirmed from Game.exe @0x6b6ca0 / @0x6b6d50 (the spec's BODY=1.30 was wrong;
+// the .rdata constant @0x8c39fc is 0x3f266666 == 0.65).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float GetHeadshotMultiplier( NAI::EHitLocation hl )   // declared in RPGUnitMission.h (shared with GetMeleeToHit)
+{
+	switch ( hl )
+	{
+		case NAI::HL_BODY:  return 0.65f;
+		case NAI::HL_HEAD:  return 0.15f;
+		case NAI::HL_RHAND:
+		case NAI::HL_LHAND: return 0.35f;
+		case NAI::HL_RLEG:
+		case NAI::HL_LLEG:  return 0.45f;
+	}
+	return 1.0f; // HL_ANY (-1) and any other -> no weighting
+}
+inline float GetThrowToHitPenalty( NAI::EHitLocation hl )
+{
+	switch ( hl )
+	{
+		case NAI::HL_BODY:  return 10.0f;
+		case NAI::HL_HEAD:  return 25.0f;
+		case NAI::HL_RHAND:
+		case NAI::HL_LHAND: return 20.0f;
+		case NAI::HL_RLEG:
+		case NAI::HL_LLEG:  return 15.0f;
+	}
+	return 0.0f;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NRPG::GetBestPose  @0x2b6bd0 (RVA) -- release-new free helper, fully recovered (no hooks). Picks the
+// firing pose with the larger positive per-weapon bonus, defaulting to WALK when neither crouch nor
+// crawl is favoured. Reads NDb::CRPGWeaponType::fCrouchBonus (+0x1c) / fCrawlBonus (+0x18); confirmed
+// from v1.2 Game.exe @0x6b6be0 (fcomp 0.0 / test ah,0x41 strictly-greater guards).
+// Grenade stance perk 0x5c uses this bonus without changing the unit's actual pose.
+NAI::EPose GetBestPose( const NDb::CRPGWeaponType &wt )
+{
+	if ( wt.fCrouchBonus > 0.f && wt.fCrawlBonus < wt.fCrouchBonus )
+		return NAI::CROUCH;
+	if ( wt.fCrawlBonus > 0.f && wt.fCrouchBonus < wt.fCrawlBonus )
+		return NAI::CRAWL;
+	return NAI::WALK;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// The blade branch of retail GetWeaponSkill (v1.2 0x6c09f4..0x6c0a96,
+// 0x6c0be4). Extra aiming AP and bullet index are zero for a thrown blade.
+float GetGrenadeThrowSkill( IUnitMission *pMission )
+{
+	float fSkill = pMission->GetRPGUnit()->Skills( NDb::ST_THROWING );
+	float fBonus;
+	if ( pMission->HasPerk( 0x5b, &fBonus ) )
+		fSkill += fBonus;
+	return fSkill * GetVPPenalty( pMission->GetRPGUnit()->Skills( NDb::ST_VP ),
+		pMission->GetHealedVP(), pMission->GetRPGUnit()->Skills( NDb::ST_VP ).GetMaxValue() );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float GetMaxThrowVelocity( IUnitMission *pMission, IGrenadeItem *pItem, bool bFirstRound )
+{
+	// Retail 0x6b7b60 uses the same physics for blades and both grenade kinds.
+	float fStrength = pMission->GetRPGUnit()->Skills( NDb::ST_STR );
+	if ( pMission->GetPanzerklein() )
+		fStrength = pMission->GetPanzerklein()->nGrenadeStrength;
+	fStrength += GetGrenadeThrowSkill( pMission ) * ( 1.f / 18.f );
+	const NDb::SToHitConstants &constants = *pMission->GetToHitConstants();
+	float fPower = constants.fGrenadeBaseCoeff + fStrength * constants.fGrenadeSTRCoeff;
+	float fWeight = GetGrenadeRecItem( pItem )->nWeight;
+	fPower *= pow( double(fWeight), double(0.74f) );
+	float fVelocity = fPower / ( fWeight * 0.001f );
+	float fMultiplier;
+	if ( pMission->HasPerk( 0x58, &fMultiplier ) )
+	{
+		// ORIGINAL RETAIL BUG FIXED (perk 88): the description increases range,
+		// not velocity. Range is proportional to velocity squared.
+		fVelocity *= sqrt( fMultiplier );
+	}
+	return fVelocity;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+static float GetKnifeThrowSkill( IUnitMission *pMission, IMeleeWeaponItem *pItem )
+{
+	bool bThrowing = pItem->GetDBMeleeWeapon()->bThrowing;
+	float fSkill = pMission->GetRPGUnit()->Skills( bThrowing ? NDb::ST_THROWING : NDb::ST_MELEE );
+	float fBonus;
+	if ( pMission->HasPerk( bThrowing ? 0x59 : 0x46, &fBonus ) )
+		fSkill += fBonus;
+	return fSkill * GetVPPenalty( pMission->GetRPGUnit()->Skills( NDb::ST_VP ),
+		pMission->GetHealedVP(), pMission->GetRPGUnit()->Skills( NDb::ST_VP ).GetMaxValue() );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// v1.2 0x6b7b60: shared throw physics, specialized here to the blade caller.
+// Weight is stored in grams; perk 88 now scales range as its description promises.
+float GetMaxThrowVelocity( IUnitMission *pMission, IMeleeWeaponItem *pItem, bool bFirstRound )
+{
+	float fStrength = pMission->GetRPGUnit()->Skills( NDb::ST_STR );
+	if ( pMission->GetPanzerklein() )
+		fStrength = pMission->GetPanzerklein()->nGrenadeStrength;
+	fStrength += GetKnifeThrowSkill( pMission, pItem ) * ( 1.f / 18.f );
+	const NDb::SToHitConstants &constants = *pMission->GetToHitConstants();
+	float fPower = constants.fGrenadeBaseCoeff + fStrength * constants.fGrenadeSTRCoeff;
+	float fWeight = pItem->GetDBItem()->nWeight;
+	fPower *= pow( double(fWeight), double(0.74f) );
+	float fVelocity = fPower / ( fWeight * 0.001f );
+	float fMultiplier;
+	if ( pMission->HasPerk( 0x58, &fMultiplier ) )
+	{
+		// ORIGINAL RETAIL BUG FIXED (perk 88): apply the range multiplier once,
+		// through its square root in the shared grenade/blade velocity formula.
+		fVelocity *= sqrt( fMultiplier );
+	}
+	return fVelocity;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float GetMaxTrowDistance( IUnitMission *pMission, IMeleeWeaponItem *pItem, bool bFirstRound )
+{
+	// v1.2 0x6b7c80: ballistic distance, converted to grid tiles.
+	float fVelocity = GetMaxThrowVelocity( pMission, pItem, bFirstRound );
+	return ( fVelocity / pMission->GetToHitConstants()->fGravity ) * fVelocity * FP_INV_GRID_STEP;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// The release gates the per-hit-location headshot reweighting on the campaign DIFFICULTY record:
+// world->GetGlobalGame()->pDifficulty->bHeadshotShouldKill (retail chain [+0x48][+0x69], resolved
+// 2026-07-12 -- CGlobalGame+0x48 = pDifficulty, CDBDifficulty+0x69 = bHeadshotShouldKill). For
+// HL_ANY GetHeadshotMultiplier==1.0 and GetThrowToHitPenalty==0, so this only affects called shots.
+static bool AreCalledShotsEnabled( NRPG::IUnitMission *pUnitMission )
+{
+	if ( !IsValid( pUnitMission ) )
+		return false;
+	CGlobalGame *pGlobalGame = pUnitMission->GetGlobalGame();
+	if ( !IsValid( pGlobalGame ) || !IsValid( pGlobalGame->pDifficulty ) )
+		return false;
+	return pGlobalGame->pDifficulty->bHeadshotShouldKill;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CToHitCalcer
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Release migration: 1st arg is the firing unit's CUnitServer*; the mission is pulled out of it
+// (server->GetUnitRPG()). nHitCover is now a FLOAT fHitCover; pUnitServer/bNight are new members. The
+// nDistance>=1 clamp is from the disasm (@0x6b8b70).
+CToHitCalcer::CToHitCalcer( CUnitServer *_pUnitServer, NAI::EPose _eCurPose, int _nDistance,
+	CVec3 _ptAttacker, int _nExtraAP, int _nSnipeAP, float _fHitCover, bool _bFirstRound, bool _bNight,
+	CVec3 _ptIllumination, int _nBullet, bool _bBackStab ):
+		eCurPose(_eCurPose), nDistance(_nDistance), ptAttacker(_ptAttacker),
+		nExtraAP(_nExtraAP), fHitCover(_fHitCover), bFirstRound(_bFirstRound), bNight(_bNight),
+		ptIllumination(_ptIllumination), nSnipeAP(_nSnipeAP), nBullet(_nBullet), bBackStab( _bBackStab ),
+		pUnitServer(_pUnitServer)
+{
+	pUnitMission = _pUnitServer->GetUnitRPG();
+	if ( nDistance < 1 )
+		nDistance = 1;
+	pWeaponItem = pUnitMission->GetRPGUnit()->GetWeaponItem();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CToHitCalcer::FillWeaponInfo()
+{
+	sWeaponInfo.nQuality = 0;
+	sWeaponInfo.nMinRange = 0;
+	sWeaponInfo.nMaxRange = 0;
+	sWeaponInfo.nShotAP = 0;
+	sWeaponInfo.nTargetingAP = 0;
+	sWeaponInfo.nRecoil = 0;
+	sWeaponInfo.nDmgMin = 0;
+	sWeaponInfo.nDmgMax = 0;
+	sWeaponInfo.nArmorPiercingAbility = 0;
+	sWeaponInfo.fScopeFactor = 0;
+	fMovePenalty = 0;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CToHitCalcer::Prepare()
+{
+	if ( IsValid( pWeaponItem ) )
+	{
+		pWeaponItem->GetInfo( &sWeaponInfo );
+		float fRangeMultiplier;
+		if ( pUnitMission->HasPerk( 0x56, &fRangeMultiplier ) )
+			sWeaponInfo.nMaxRange = int( sWeaponInfo.nMaxRange * fRangeMultiplier );
+		fMovePenalty = pWeaponItem->GetDBWeapon()->pWeaponType->fMovePenalty;
+		if ( pWeaponItem->GetShootMode() == NDb::SM_Snipe )
+			nExtraAP += nSnipeAP;
+	}
+	else
+		FillWeaponInfo();
+	nSkill = int( pUnitMission->GetWeaponSkill( pWeaponItem, nExtraAP, nBullet ) );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetStance()
+{
+	int nStance = 0;
+	CPtr<CWeaponItem> pWeaponItem = pUnitMission->GetRPGUnit()->GetWeaponItem();
+	if ( IsValid( pWeaponItem ) )
+	{
+		NAI::EPose pose = eCurPose;
+		if ( pUnitMission->HasPerk( N_PERK_BEST_SHOOTING_POSE ) )
+			pose = GetBestPose( *pWeaponItem->GetDBWeapon()->pWeaponType );
+		if ( NAI::CROUCH == pose )
+			nStance = int( pWeaponItem->GetDBWeapon()->pWeaponType->fCrouchBonus );
+		else if ( NAI::CRAWL == pose )
+			nStance = int( pWeaponItem->GetDBWeapon()->pWeaponType->fCrawlBonus );
+	}
+	return nStance;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetD1()
+{
+	return float(nSkill) * ( sWeaponInfo.nMaxRange - sWeaponInfo.nMinRange ) / float(N_MAX_SKILL) + sWeaponInfo.nMinRange;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetD2()
+{
+	float fD1 = GetD1();
+	float fDTH = Cos3DistanceFunc( nDistance, fD1 );
+	fDTH = Clamp( fDTH, 2.f, 100.f );
+	if ( nDistance > fD1 * 2 )
+		fDTH = 0;
+	return fDTH;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetRS()
+{
+	int nRepeats = pUnitMission->GetLastActionTimes();
+	float fParam;
+	if ( pUnitMission->HasPerk( N_PERK_ZEROING_BONUS, &fParam ) )
+		nRepeats = int( nRepeats + double( fParam ) );
+	return Min( nRepeats, pUnitMission->GetToHitConstants()->nMaxShotsRepeat ) * 2;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetSMove()
+{
+	float fRes = 0;
+	//
+	if ( !bFirstRound )
+		fRes = Min( pUnitMission->GetMoveInLastTurn(),
+			pUnitMission->GetToHitConstants()->nSMaxMove ) * fMovePenalty;
+	// Retail v1.2 0x6b6ed7: perk 19 cancels the additive movement penalty.
+	if ( pUnitMission->HasPerk( 0x13 ) )
+		return 0;
+	return fRes;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetLight()
+{
+	CVec3 ptLight = CVec3( Clamp(ptIllumination.x, 0.f, 1.f),
+		Clamp(ptIllumination.y, 0.f, 1.f), Clamp(ptIllumination.z, 0.f, 1.f) );
+	float fRes = 0.5f * (1 + fabs( ptLight ) / fabs( CVec3(1,1,1) ) );
+	// release-new: at night the light factor drops 10% unless the unit has night-vision (perk 0x15).
+	// Unit-target previews, attacks and incidental bullet rolls pass the night flag.
+	if ( bNight && !pUnitMission->HasPerk( 0x15 ) )
+		fRes *= 0.9f;
+	return fRes;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetFRMult()
+{
+	if ( pUnitMission->HasPerk( N_PERK_NO_FIRST_TURN_PENALTY ) )
+		return Max( pUnitMission->GetToHitConstants()->fFirstRoundCoeff, 1.f );
+	return bFirstRound ? pUnitMission->GetToHitConstants()->fFirstRoundCoeff : 1;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetAllMult()
+{
+	return Max( 0.f, GetAllAdd() * GetLight() * GetFRMult() );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetSnipeAdd()
+{
+	float fMaxSkillAdd = pUnitMission->GetRPGUnit()->Skills( NDb::ST_SNIPE ) *
+		1.f / pUnitMission->GetToHitConstants()->nSnipingCoeff;
+	float fAPSnipeAdd = nSnipeAP * 1.f / pUnitMission->GetToHitConstants()->nSnipingCoeff;
+	return ( fAPSnipeAdd <= fMaxSkillAdd ) ? fAPSnipeAdd : fMaxSkillAdd;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetTArea()
+{
+	return 1;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetCA()
+{
+	float fTArea = GetTArea();
+	float fTCover = fHitCover / 100.f;
+	// Retail v1.2 0x6b7053..0x6b707e: perk 72 scales cover, preserving area.
+	float fCoverMultiplier;
+	if ( pUnitMission->HasPerk( 0x48, &fCoverMultiplier ) )
+		fTCover *= fCoverMultiplier;
+	float fScopeFactor = sWeaponInfo.fScopeFactor; // 20 - normal weapon // 100 - sniper rifle
+	float fDistCoeff = DistanceFunc( nDistance, fScopeFactor );
+	return ( (100-fDistCoeff)*(fTCover*fTArea)+fDistCoeff ) / 100.0f;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetAllAdd()
+{
+	// Retail 0x6b8410: keep the stored-float sums and the familiarity/quality tail in order.
+	float fRes = GetSMove() + GetRS();
+	fRes += GetStance();
+	fRes += GetD2();
+	fRes = double( fRes ) + pUnitMission->GetWeaponAdaptation() + sWeaponInfo.nQuality;
+	//
+	if ( IsValid( pWeaponItem ) )
+	{
+		NDb::EShootMode ShotMode = pWeaponItem->GetShootMode();
+		float fTargeting = 1;
+		if ( ShotMode == NDb::SM_Snipe )
+			pUnitMission->HasPerk( N_PERK_FASTER_TARGETING, &fTargeting );
+		if ( ShotMode == NDb::SM_Aimed || ShotMode == NDb::SM_Careful )
+			fRes += sWeaponInfo.nTargetingAP;
+		if ( ShotMode == NDb::SM_Careful || ShotMode == NDb::SM_Snipe )
+			// Retail 0x6b8410: two separate truncations; perk 73 scales sniper targeting only.
+			fRes += int( GetSMove() ) - int( double( nExtraAP ) * fTargeting * -1.5 );
+	}
+	//
+	return fRes;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Retail CheckAuraPerk @0x289ec0: add both float parameters of an aura perk when it is present.
+static void CheckAuraPerk( IUnitMission *pUnit, int nPerkID, float *pToHit, float *pEvasion )
+{
+	float fToHit = 0;
+	float fEvasion = 0;
+	if ( IsValid( pUnit ) && pUnit->HasPerk( nPerkID, &fToHit, &fEvasion ) )
+	{
+		*pToHit += fToHit;
+		*pEvasion += fEvasion;
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Retail GetAuraAdd @0x289f00. Allied units within 3.125 metres contribute perk 0x1c. The owner's
+// final aura perk depends on whether at least one nearby unit has the same player pointer:
+// 0x42 when it does, 0x5d otherwise. Both the attack and evasion terms are accumulated.
+void GetAuraAdd( float *pToHit, float *pEvasion, CUnitServer *pUnit )
+{
+	*pToHit = 0;
+	*pEvasion = 0;
+	if ( !IsValid( pUnit ) )
+		return;
+
+	NWorld::CWorld *pWorld = pUnit->GetWorld();
+	if ( !IsValid( pWorld ) )
+		return;
+
+	list<CPtr<CUnitServer> > units;
+	pWorld->GetUnitsNear( pUnit->GetPosition().GetCP(), &units, 3.125f );
+	bool bSamePlayer = false;
+	for ( list<CPtr<CUnitServer> >::iterator i = units.begin(); i != units.end(); ++i )
+	{
+		CUnitServer *pOther = *i;
+		if ( !IsValid( pOther ) || pOther == pUnit )
+			continue;
+		if ( pUnit->GetDiplomacyState( pOther ) == NDb::DS_ALLY )
+			CheckAuraPerk( pOther->GetUnitRPG(), 0x1c, pToHit, pEvasion );
+		if ( pOther->GetPlayer() == pUnit->GetPlayer() )
+			bSamePlayer = true;
+	}
+	CheckAuraPerk( pUnit->GetUnitRPG(), bSamePlayer ? 0x42 : 0x5d, pToHit, pEvasion );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Retail v1.2 0x6b85b0: any non-clear weather applies the same penalty.
+float CToHitCalcer::GetWeatherPenalty()
+{
+	return IsValid( pUnitServer ) && pUnitServer->GetWorld()->GetWeather() != 0 ? 5.0f : 0.0f;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetCarefulShootPerk()
+{
+	if ( IsValid( pWeaponItem ) && pWeaponItem->GetShootMode() == NDb::SM_Careful )
+	{
+		float fOut = 0;
+		if ( pUnitMission->HasPerk( 0x45, &fOut ) )
+			return fOut;
+	}
+	return 0;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CToHitCalcer::GetAuraToHitAdd()
+{
+	float fToHit = 0;
+	float fEvasion = 0;
+	GetAuraAdd( &fToHit, &fEvasion, pUnitServer );
+	return fToHit;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int CToHitCalcer::GetToHit()
+{
+	Prepare();
+	// retail @0x2b85e0 (disasm 0x6b85eb: fld fHitCover; fcomp [0x8d54dc]=0.0f; test ah,0x41; jp):
+	// the gate is fHitCover <= 0 -> 0%, NOT strict <. GetHitCover (@0x2b4390) returns exactly 0.0
+	// when hitRays is EMPTY (every candidate ray obstructed at the muzzle -- target fully walled
+	// off; the case RealPeekRay @0x2b3f00 logs "Kick the programmers"); strict < let that case
+	// through and the UI showed a live % for an unreachable target.
+	if ( fHitCover <= 0.0f )
+		return 0;
+	fToHit = GetAllMult() + ( GetAuraToHitAdd() + GetCarefulShootPerk() ) - GetWeatherPenalty();
+	fToHit = Clamp( fToHit, 2.0f, 100.0f );
+	return int( fToHit + 0.5f );  // release rounds the result (fistp), unlike the dev's truncation
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CToHitCalcer::Log()
+{
+	csRPG << "<font size=16pt>";
+	csRPG << CC_GREEN << "General ToHit:";
+	csRPG << CC_ORANGE << "\tDist=" << CC_GREY << nDistance;
+	csRPG << CC_ORANGE << "\tW+=" << CC_GREY << sWeaponInfo.nQuality;
+	csRPG << CC_ORANGE << "\tMinRange=" << CC_GREY << sWeaponInfo.nMinRange;
+	csRPG << CC_ORANGE << "\tMaxRange=" << CC_GREY << sWeaponInfo.nMaxRange;
+	csRPG << CC_ORANGE << "\tBulletNumber=" << CC_GREY << nBullet << endl;
+	csRPG << "<font size=16pt>";
+	csRPG << CC_ORANGE << "\tStance=" << CC_GREY << GetStance();
+	csRPG << CC_ORANGE << "\tDerSkill=" << CC_GREY << nSkill;
+	csRPG << CC_ORANGE << "\tD1=" << CC_GREY << GetD1();
+	csRPG << CC_ORANGE << "\tD2=" << CC_GREY << GetD2();
+	csRPG << CC_ORANGE << "\tZeroingIn(RS)=" << CC_GREY << GetRS();
+	csRPG << CC_ORANGE << "\tAddAP=" << CC_GREY << nExtraAP;
+	csRPG << CC_ORANGE << "\tTCover=" << CC_GREY << fHitCover;
+	csRPG << CC_ORANGE << "\tTArea=" << CC_GREY << GetTArea();
+	csRPG << CC_ORANGE << "\tCA=" << CC_GREY << GetCA();
+	csRPG << CC_ORANGE << "\tSMove=" << CC_GREY << GetSMove() << endl;
+	csRPG << "<font size=16pt>";
+	csRPG << CC_ORANGE << "\tLight=" << CC_GREY << GetLight();
+	csRPG << CC_ORANGE << "\tFRmult=" << CC_GREY << GetFRMult();
+	csRPG << CC_ORANGE << "\tAllAdd=" << CC_GREY << GetAllAdd();
+	csRPG << CC_ORANGE << "\tAllAddMult=" << CC_GREY << GetAllMult();
+	csRPG << CC_GREEN << "\tToHit = " << GetAllAdd() << "\n";
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CUnitToHitCalcer
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CUnitToHitCalcer::CUnitToHitCalcer(	CUnitServer *_pUnitServer, NAI::EPose _eCurPose,
+		int _nDistance,	CVec3 _ptAttacker, NAI::SPosition _sTargetPosition, int _nExtraAP, int _nSnipeAP,
+		float _fHitCover, bool _bFirstRound, bool _bNight, CVec3 _ptIllumination, NAI::EHitLocation _eHitLocation,
+		CUnitServer *_pTarget, int _nBullet, bool _bBackStab ) :
+			CToHitCalcer( _pUnitServer, _eCurPose, _nDistance, _ptAttacker, _nExtraAP, _nSnipeAP, _fHitCover,
+			_bFirstRound, _bNight, _ptIllumination, _nBullet, _bBackStab ), sTargetPosition(_sTargetPosition),
+			eHitLocation(_eHitLocation), pTarget(_pTarget)
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int CUnitToHitCalcer::GetToHit()
+{
+	Prepare();
+	// retail @0x2b86c0: same <=0 cover gate as CToHitCalcer::GetToHit (disasm 0x6b86cb,
+	// fcomp against the 0.0f global; strictly-greater continues). 0.0 = empty hitRays.
+	if ( fHitCover <= 0.0f )
+		return 0;
+	float fDef = 0;
+	if ( !bBackStab )
+		fDef = GetTAuraEvasionAdd() + pTarget->GetUnitRPG()->GetIC() / pUnitMission->GetToHitConstants()->fICModifier;
+	fToHit = GetAllMult() * GetCA() + GetCarefulShootPerk() + GetAuraToHitAdd() - fDef - GetWeatherPenalty();
+	fToHit = Clamp( fToHit, 2.0f, 100.0f );
+	return int( fToHit + 0.5f );  // release rounds the result (fistp), unlike the dev's truncation
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NRPG::GetTAreaReal  @0x2b8800 (RVA) -- release-new free helper extracted as the single source of truth
+// for the target silhouette area. The per-HL-location area switch collapses to a single HL_HEAD*0.2 case
+// (confirmed from Game.exe @0x6b8800: sub eax,1 / jne / fmul 0.2); the rest of the per-location weighting
+// moved into the GetCA headshot multiplier. CUnitToHitCalcer::GetTArea is the thin wrapper that forwards
+// its target position, attacker eye-point and hit-location -- one source of truth, no divergent copy.
+float GetTAreaReal( const NAI::SPosition &sTargetPosition, const CVec3 &ptAttacker, NAI::EHitLocation eHitLocation )
+{
+	vector<CVec3> vCubes;
+	GetOccupiedCubes( &vCubes, sTargetPosition );
+	float fTArea = GetCubesArea( ptAttacker, &vCubes );
+	if ( eHitLocation == NAI::HL_HEAD )
+		fTArea *= 0.2f;
+	return fTArea;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CUnitToHitCalcer::GetTArea()
+{
+	return GetTAreaReal( sTargetPosition, ptAttacker, eHitLocation );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CUnitToHitCalcer::GetTMove()
+{
+	CVec3 ptTMove = FP_INV_GRID_STEP * ( sTargetPosition.GetCP() - pTarget->GetUnitRPG()->GetTurnStartCP() );
+	CVec3 ptTDir  = sTargetPosition.GetCP() - ptAttacker;
+	float fTargetMoveDist = fabs( ptTMove );
+	Normalize( &ptTMove );
+	Normalize( &ptTDir );
+	float fCos = ptTDir * ptTMove;
+	float fTargetMoveDir = sqrt(1 - fCos * fCos);
+
+	float fRes = Min( fTargetMoveDist * fTargetMoveDir,
+		(float)pUnitMission->GetToHitConstants()->nMaxMoveBonus );
+	if ( bFirstRound )
+		fRes = 0;
+	// Retail v1.2 0x6b7803: perk 14 multiplies the projected movement penalty
+	// by Param1, not by the earlier direction-cosine local.
+	float fMoveMultiplier;
+	if ( pTarget->GetUnitRPG()->HasPerk( 0xe, &fMoveMultiplier ) )
+		return fMoveMultiplier * fRes;
+	return fRes;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CUnitToHitCalcer::GetAllAdd()
+{
+	return CToHitCalcer::GetAllAdd() - GetTMove();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CUnitToHitCalcer::GetCA()
+{
+	float fCA = CToHitCalcer::GetCA();
+	float fOut = 0;
+	// release-new: the target's no-cover perk (0x11) divides the cover/area factor by its float param.
+	// ORIGINAL BUG (confirmed Game.exe @0x2b7840 `fdiv [esp+8]`, no zero guard): a zero param -> +/-inf.
+	if ( pTarget->GetUnitRPG()->HasPerk( 0x11, &fOut ) )
+		fCA = fCA / fOut;
+	// release-new: per-hit-location headshot reweighting when called shots are enabled (the
+	// difficulty's bHeadshotShouldKill). For HL_ANY GetHeadshotMultiplier==1.0 -> no-op for normal shots.
+	if ( AreCalledShotsEnabled( pUnitMission ) )
+		fCA *= GetHeadshotMultiplier( eHitLocation );
+	return fCA;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CUnitToHitCalcer::GetTAuraEvasionAdd()
+{
+	float fToHit = 0;
+	float fEvasion = 0;
+	GetAuraAdd( &fToHit, &fEvasion, pTarget );
+	return fEvasion;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CUnitToHitCalcer::Log()
+{
+	CToHitCalcer::Log();
+	csRPG << "<font size=16pt>";
+	csRPG << CC_ORANGE << "Unit ToHit:\tTMove=" << CC_GREY << GetTMove();
+	csRPG << CC_ORANGE << "\tHL=" << CC_GREY << GetHLName( eHitLocation );
+	csRPG << CC_ORANGE << "\tBaseIC=" << CC_GREY << pTarget->GetUnitRPG()->GetIC() << "\n";
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CTileToHitCalcer
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CTileToHitCalcer::CTileToHitCalcer( CUnitServer *_pUnitServer, NAI::EPose _eCurPose,
+	int _nDistance,	CVec3 _ptAttacker, int _nExtraAP, float _fHitCover, bool _bFirstRound, bool _bNight,
+	CVec3 _ptIllumination, CVec3 _ptTilePos, int _nBullet ) :
+		CToHitCalcer( _pUnitServer, _eCurPose, _nDistance, _ptAttacker, _nExtraAP, 0, _fHitCover,
+			_bFirstRound, _bNight, _ptIllumination, _nBullet, false ), ptTilePos(_ptTilePos)
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CTileToHitCalcer::GetTArea()
+{
+	return 0.33f;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CGrenadeToHitCalcer
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// release: the thrown grenade is no longer a ctor argument -- it is the unit's active inventory item
+// (GetUnit()->GetGrenadeItem()); the member is the runtime IGrenadeItem (was the DB CRPGGrenade).
+CGrenadeToHitCalcer::CGrenadeToHitCalcer( CUnitServer *_pUnitServer, NAI::EPose _eCurPose, int _nDistance,
+	CVec3 _ptAttacker, bool _bFirstRound, bool _bNight, CVec3 _ptIllumination, CVec3 _ptTilePos,
+	NRPG::IGrenadeItem *_pGrenade ) :
+		CToHitCalcer( _pUnitServer, _eCurPose, _nDistance, _ptAttacker, 0, 0, 0, _bFirstRound, _bNight, _ptIllumination, 0, false ),
+		ptTilePos(_ptTilePos)
+{
+	// Release derives the thrown grenade from the unit's ACTIVE item (CUnit::GetGrenadeItem @0x2ba630 ->
+	// inventory GetActive). That is correct for the player throw and CExecThrowGrenade, where the grenade
+	// is already equipped/active. But the AI evaluates a grenade still sitting in the inventory
+	// (CanUnitThrowGrenade), so GetActive returns the equipped weapon, the cast to IGrenadeItem yields
+	// null, and Prepare() dereferences a null grenade -> crash / AI silently aborts. Use the explicit
+	// grenade the AI/script caller already holds; fall back to the active item only when none is supplied.
+	if ( _pGrenade )
+		pGrenade = _pGrenade;
+	else
+		pGrenade = CDynamicCast<NRPG::IGrenadeItem>( pUnitMission->GetRPGUnit()->GetInventory()->GetActive() );
+	Prepare();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CGrenadeToHitCalcer::Prepare()
+{
+	CToHitCalcer::Prepare();
+	nSkill = int( pUnitMission->GetWeaponSkill( pGrenade, nExtraAP, nBullet ) );
+	// retail @0x2b88d0 reads the weapon type off whichever record the item carries (regular
+	// grenade OR engineer grenade) -- the bare GetDBGrenade() deref crashed on equipping TNT.
+	fMovePenalty = GetGrenadeRecWeaponType( pGrenade )->fMovePenalty;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CGrenadeToHitCalcer::GetStance()
+{
+	const NDb::CRPGWeaponType &wt = *GetGrenadeRecWeaponType( pGrenade );
+	NAI::EPose pose = eCurPose;
+	// Retail v1.2 0x6b7a29..0x6b7a49: perk 92 grants the best stance's
+	// throwing bonus regardless of the thrower's current pose.
+	if ( pUnitMission->HasPerk( 0x5c ) )
+		pose = GetBestPose( wt );
+	int nStance = 0;
+	if ( pose == NAI::CROUCH )
+		nStance = int( wt.fCrouchBonus );
+	else if ( pose == NAI::CRAWL )
+		nStance = int( wt.fCrawlBonus );
+	return nStance;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CGrenadeToHitCalcer::FillWeaponInfo()
+{
+	CToHitCalcer::FillWeaponInfo();
+	sWeaponInfo.nQuality = GetGrenadeRecQuality( pGrenade );
+	sWeaponInfo.nMinRange = GetGrenadeMaxDistance();
+	// Retail v1.2 0x6b7d7e..0x6b7da0: GetD1 interpolates between the
+	// ballistic range and 1.5 times that range using the derived throwing skill.
+	sWeaponInfo.nMaxRange = int( sWeaponInfo.nMinRange * 1.5f );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CGrenadeToHitCalcer::GetMaxImp()
+{
+	float fBaseStr = float( pUnitMission->GetRPGUnit()->Skills( NDb::ST_STR ) );
+	if ( pUnitMission->GetPanzerklein() )
+		fBaseStr = pUnitMission->GetPanzerklein()->nGrenadeStrength;
+	float fStr = fBaseStr + float(nSkill) / 18.f;
+	float fRes = pUnitMission->GetToHitConstants()->fGrenadeBaseCoeff;
+	fRes += pUnitMission->GetToHitConstants()->fGrenadeSTRCoeff * fStr;
+	fRes *= pow( float(GetGrenadeRecItem( pGrenade )->nWeight), 0.74f );
+	return fRes;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CGrenadeToHitCalcer::GetRelWeight()
+{
+	return float(GetGrenadeRecItem( pGrenade )->nWeight) / 1000.f; // i.e. in kilograms
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CGrenadeToHitCalcer::GetMaxGrenadeVelocity()
+{
+	return GetMaxThrowVelocity( pUnitMission, pGrenade, bFirstRound );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int CGrenadeToHitCalcer::GetGrenadeMaxDistance()
+{
+	float fVelocity = GetMaxGrenadeVelocity();
+	return int( ( fVelocity / pUnitMission->GetToHitConstants()->fGravity ) * fVelocity * FP_INV_GRID_STEP );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CGrenadeToHitCalcer::GetAllAdd()
+{
+	return sWeaponInfo.nQuality + GetD2() + GetStance() - GetSMove();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int CGrenadeToHitCalcer::GetToHit()
+{
+	Prepare();
+	fToHit = GetAllMult() + ( GetAuraToHitAdd() + GetCarefulShootPerk() ) - GetWeatherPenalty();
+	fToHit = Clamp( fToHit, 2.0f, 100.0f );
+	return int( fToHit );  // v1.2 0x6b8a44..0x6b8a58 explicitly selects x87 truncation.
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CGrenadeToHitCalcer::Log()
+{
+	csRPG << "<font size=16pt>";
+	csRPG << CC_GREEN << " \tGrenade ToHit: ";
+	csRPG << CC_ORANGE << "\tSkill=" << CC_GREY << pUnitMission->GetRPGUnit()->Skills( NDb::ST_THROWING );
+	csRPG << CC_ORANGE << "\tDist=" << CC_GREY << nDistance;
+	csRPG << CC_ORANGE << "\tMaxGrenadeRange=" << CC_GREY << GetGrenadeMaxDistance();
+	csRPG << CC_ORANGE << "\tW+=" << CC_GREY << sWeaponInfo.nQuality;
+	csRPG << CC_ORANGE << "\tStance=" << CC_GREY << GetStance();
+	csRPG << CC_ORANGE << "\tSMvDist=" << CC_GREY << pUnitMission->GetMoveInLastTurn();
+	csRPG << endl;
+	csRPG << "<font size=16pt>";
+	csRPG << CC_ORANGE << "\tDerSkill=" << CC_GREY << nSkill;
+	csRPG << CC_ORANGE << "\tD1=" << CC_GREY << GetD1();
+	csRPG << CC_ORANGE << "\tD2=" << CC_GREY << GetD2();
+		csRPG << CC_ORANGE << "\tLight=" << CC_GREY << GetLight();
+	csRPG << CC_ORANGE << "\tFRmult=" << CC_GREY << GetFRMult();
+	csRPG << CC_ORANGE << "\tAllAdd=" << CC_GREY << GetAllAdd();
+	csRPG << CC_ORANGE << "\tAllAddMult=" << CC_GREY << GetAllMult();
+	csRPG << CC_GREEN << "\t ToHit = " << fToHit << "\n";
+	csRPG << CC_ORANGE << "\tMaxImpulse = " << GetMaxImp() << " MaxVelocity = " << GetMaxGrenadeVelocity() << "\n";
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAIUnitToHitCalcer
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// The ctor keeps the dev IAIUnit* shape (an internal API, not serialized) and derives both
+// CUnitServer*s to chain the release CUnitToHitCalcer ctor. Retail GetAIShootToHit
+// (v1.2 0x6b4960) supplies the mission game's night flag to this constructor.
+CAIUnitToHitCalcer::CAIUnitToHitCalcer(	NAI::IAIUnit *pShooter, const NAI::SUnitPosition &shooterPos,
+	NAI::IAIUnit *pTarget, float fHitCover, NAI::EHitLocation _eHitLocation, int _nBullet, IInventoryItem *_pWeapon, int _nExtraAP ):
+		CUnitToHitCalcer( pShooter->GetUnitServer(),
+		shooterPos.GetPose(),
+		fabs( shooterPos.GetCP() - pTarget->GetPosition().GetCP() ) / FP_GRID_STEP,
+		shooterPos.GetEyePosition(),
+		pTarget->GetPosition(),
+		_nExtraAP, 0, fHitCover, false, pShooter->GetUnitServer()->GetWorld()->GetGame()->IsNight(), CVec3( 1, 1, 1 ),
+		_eHitLocation,
+		pTarget->GetUnitServer(),
+		_nBullet, false )
+{
+	CDynamicCast<CWeaponItem> pWeapon( _pWeapon );
+	pWeaponItem = pWeapon;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CAIUnitToHitCalcer::GetTArea()
+{
+	return 1;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+float CAIUnitToHitCalcer::GetTMove()
+{
+	return 0;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CRLauncherToHitCalcer
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CRLauncherToHitCalcer::CRLauncherToHitCalcer( CUnitServer *_pUnitServer, NAI::EPose _eCurPose,
+	int _nDistance,	CVec3 _ptAttacker, float _fHitCover, int _nExtraAP, bool _bFirstRound, bool _bNight,
+	CVec3 _ptIllumination, CVec3 _ptTilePos ) :
+		CToHitCalcer( _pUnitServer, _eCurPose, _nDistance, _ptAttacker, _nExtraAP, 0, _fHitCover,
+			_bFirstRound, _bNight, _ptIllumination, 1, false ), ptTilePos(_ptTilePos)
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int CRLauncherToHitCalcer::GetMaxDistance()
+{
+	return pWeaponItem->GetDBWeapon()->nMaxRange;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CThrowKnifeToHitCalcer
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int CThrowKnifeToHitCalcer::GetKnifeMaxDistance()
+{
+	return int( GetMaxTrowDistance( pUnitMission, pMeleeWeapon, bFirstRound ) );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CThrowKnifeToHitCalcer::FillWeaponInfo()
+{
+	// v1.2 0x6b81f0: both conversions truncate, including the first range.
+	CToHitCalcer::FillWeaponInfo();
+	sWeaponInfo.nMinRange = GetKnifeMaxDistance();
+	sWeaponInfo.nMaxRange = int( sWeaponInfo.nMinRange * 1.5f );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CThrowKnifeToHitCalcer::Prepare()
+{
+	FillWeaponInfo();
+	nSkill = pUnitMission->GetRPGUnit()->Skills( NDb::ST_THROWING );
+	float fVPPenalty = GetVPPenalty( pUnitMission->GetRPGUnit()->Skills( NDb::ST_VP ),
+		pUnitMission->GetHealedVP(), pUnitMission->GetRPGUnit()->Skills(NDb::ST_VP).GetMaxValue() );
+	nSkill *= fVPPenalty;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CThrowKnifeToHitCalcer::CThrowKnifeToHitCalcer( CUnitServer *_pUnitServer, NAI::EPose _eCurPose, int _nDistance,
+	CVec3 _ptAttacker, float _fHitCover, bool _bFirstRound, bool _bNight, CVec3 _ptIllumination,
+	int _nExtraAP, bool _bBackStab ):
+		CToHitCalcer( _pUnitServer, _eCurPose, _nDistance, _ptAttacker, _nExtraAP, 0, _fHitCover,
+			_bFirstRound, _bNight, _ptIllumination, 1, _bBackStab )
+{
+	// release-new: the thrown blade item (GetUnit()->GetMeleeWeaponItem()).
+	pMeleeWeapon = pUnitMission->GetRPGUnit()->GetMeleeWeaponItem();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CThrowKnifeUnitToHitCalcer  (release-new)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CThrowKnifeUnitToHitCalcer::CThrowKnifeUnitToHitCalcer( CUnitServer *_pUnitServer, NAI::EPose _eCurPose, int _nDistance,
+	CVec3 _ptAttacker, float _fHitCover, bool _bFirstRound, bool _bNight, CVec3 _ptIllumination,
+	CUnitServer *_pTarget, NAI::EHitLocation _eHitLocation, const NAI::SPosition &_targetPos, int _nExtraAP, bool _bBackStab ):
+		CThrowKnifeToHitCalcer( _pUnitServer, _eCurPose, _nDistance, _ptAttacker, _fHitCover, _bFirstRound,
+			_bNight, _ptIllumination, _nExtraAP, _bBackStab ),
+		pTarget(_pTarget), eHitLocation(_eHitLocation), targetPos(_targetPos)
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int CThrowKnifeUnitToHitCalcer::GetToHit()
+{
+	Prepare();
+	// retail @0x2b8a50: same <=0 cover gate (disasm 0x6b8a5b). CGrenadeToHitCalcer
+	// @0x2b8990 deliberately has NO gate (grenades arc over cover) -- dev matches.
+	if ( fHitCover <= 0.0f )
+		return 0;
+	fToHit = GetAllMult() + ( GetAuraToHitAdd() + GetCarefulShootPerk() ) - GetWeatherPenalty();
+	// release: called shots enabled -> per-HL headshot multiplier on the whole result; else the
+	// per-HL throw penalty is subtracted. For HL_ANY both branches agree (mult 1.0 / penalty 0).
+	if ( AreCalledShotsEnabled( pUnitMission ) )
+		fToHit = GetHeadshotMultiplier( eHitLocation ) * fToHit;
+	else
+		fToHit = fToHit - GetThrowToHitPenalty( eHitLocation );
+	fToHit = Clamp( fToHit, 2.0f, 100.0f );
+	return int( fToHit );  // v1.2 0x6b8b50..0x6b8b70 selects truncate mode, not round-to-nearest.
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CThrowKnifeTileToHitCalcer
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CThrowKnifeTileToHitCalcer::CThrowKnifeTileToHitCalcer( CUnitServer *_pUnitServer, NAI::EPose _eCurPose,
+	int _nDistance,	CVec3 _ptAttacker, float _fHitCover, bool _bFirstRound, bool _bNight, CVec3 _ptIllumination,
+	CVec3 _ptTilePos, int _nExtraAP ) :
+		CThrowKnifeToHitCalcer( _pUnitServer, _eCurPose, _nDistance, _ptAttacker, _fHitCover,
+			_bFirstRound, _bNight, _ptIllumination, _nExtraAP, false ), ptTilePos(_ptTilePos)
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+//
+using namespace NRPG;
+//
+// W5 serialization-convergence: ALL ToHitCalcer REGISTRATIONS REMOVED (0x52132140 CUnitToHitCalcer,
+// 0x52232150 CTileToHitCalcer, 0x52232160 CGrenadeToHitCalcer, 0x51262180 CAIUnitToHitCalcer,
+// 0x72762140 CRLauncherToHitCalcer, 0x52132170 CThrowKnifeUnitToHitCalcer). Retail registers NO
+// calcer id at all (retail RPGToHit.obj holds only free functions -- GetToHitType @0x2b3790 etc.);
+// calcers are TRANSIENT: every consumer holds a local CPtr temporary, no operator& serializes one
+// (CExecThrowGrenade::pToHitCalcer is deliberately excluded from its tags 1-6, byte-matching retail
+// @0x3afc10). The classes stay as runtime logic.

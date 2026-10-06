@@ -1,0 +1,863 @@
+#include "StdAfx.h"
+//
+#include "..\DBFormat\DataRPG.h"
+#include "aiPosition.h"
+#include "aiUnit.h"
+#include "aiState.h"
+#include "aiNearestPosition.h" // NAI::GetNearestPosition (TerrorPK rampage target)
+#include "aiMoveAction.h"      // NAI::GetUnitPos
+#include "aiInventory.h"
+#include "aiWeapon.h"
+#include "AILog.h"             // dev log records (reused)
+#include "aiCombatLog.h"       // CAILog (release container)
+#include "wMain.h"
+#include "wUnitServer.h"
+#include "wUnitCommands.h"
+#include "rpgItem.h"
+#include "RPGItemSet.h"       // full NRPG::CGrenadeItem / CWeaponItem defs (the IGrenadeItem/IWeaponItem
+                              // bases must be VISIBLE here, else the item->interface upcast silently fails)
+#include "rpgUnitMission.h"
+#include "rpgUnitInfo.h"
+#include "RPGUnit.h"          // NRPG::CUnit::Skills (suit HP via ST_VP), CDynamicSkill
+#include "Grid.h"
+#include "wUnitAttackExec.h" // shared first-aid probe, including planned kit/target position
+//
+#include "aiActions.h"
+//
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Release CAICombatLogic substrate - concrete action bodies (structural port). WIP - NOT yet in
+// Main.vcxproj. Phase 3b: the attack family (shoot/grenade/rocket) faithfully adapted from the dev
+// aiAttackAction.cpp to the release CAIAction (Do(CAILog*) via operator<<, SInfo+SActionInfo cache,
+// rebased on IAIUnit). The enemy-group helpers are carried over verbatim. The remaining 16 actions
+// follow in the phase-3b continuation.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NWorld
+{
+	EUnitCommandResult CanUnitThrowGrenade( CUnitServer *pUS, const NAI::SUnitPosition &from, const CVec3 &ptTarget, NRPG::IGrenadeItem *pGrenade );
+	EUnitCommandResult CanUnitLaunchRocket( CUnitServer *pUS, const NAI::SUnitPosition &from, const CVec3 &ptTarget, int nExtraAP, NRPG::IWeaponItem *pBazooka );
+	EUnitCommandResult CanUnitThrowKnife( CUnitServer *pUS, const NAI::SUnitPosition &from, const CVec3 &ptTarget, NRPG::IMeleeWeaponItem *pMelee );
+	bool IsWithinHumanReach( const CVec3 &ptFrom, const CVec3 &ptTarget, float fPlaneDist );
+}
+//
+namespace NAI
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAIShootAction
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAIShootAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const
+{
+	pInfo->bCanDo = false;
+	if ( !IsValid( GetUnit() ) || !IsValid( GetEnemy() ) )
+		return;
+	//
+	// GetBestFireArms reports cover (int) + a quality/expected-damage estimate (int) used only to decide
+	// bKillTargetCertainly; the release SInfo keeps neither raw value (cover is stored as the float fCover).
+	int nCover = 0, nQuality = 0;
+	pInfo->pWeapon =
+		GetUnit()->GetAIInventory()->GetBestFireArms( place.place, GetEnemy(), place.nUnitAP, &nCover, &nQuality, &pInfo->shootMode, &pInfo->nToHit );
+	// @0x41bf30 -- retail gates bCanDo on IsNeedReload(weapon)==false AND nToHit>0. IsNeedReload @0x4b5bd0
+	// == (current clip present && not destroyed && ammo>0); an empty clip is NOT shootable here even with a
+	// spare in inventory -- CAIReloadAction reloads first -- so the dev "empty-but-has-next-clip still bCanDo"
+	// escape is DROPPED, and the previously-ungated nToHit<=0 now fails too. IsValid(pInfo->pWeapon) already
+	// excludes a null/destroyed weapon (== retail weapon+7 bit 0x80). The clip fetch is null-guarded.
+	CAIFireArmsWeaponClip *pClip = IsValid( pInfo->pWeapon ) ? pInfo->pWeapon->GetCurrentClip() : 0;
+	bool bNeedReload = !IsValid( pClip ) || pClip->GetAmmoCount() <= 0;
+	if ( IsValid( pInfo->pWeapon ) && !bNeedReload && pInfo->nToHit > 0 )
+	{
+		pInfo->bCanDo = true;
+		pInfo->fCover = (float)nCover;
+		// ORACLE @0x41bf30: release aims the head when nToHit>50 && a unit aim-metric>5.0f -- the metric is
+		// enemy->vtbl[0]( weapon item +0xc, 1 ) fed to unit->vtbl[0x30]( &place, enemyVal ). Those two IAIUnit
+		// vtable slots are not named in-tree (and the a5dll vtable is reordered), so the aimed-head path stays
+		// DEFERRED and the unit fires center-mass. See FLAGGED-NEXT.
+		pInfo->hitLocation = HL_ANY;
+		pInfo->nAPToSpend = place.nUnitAP;        // the shot budget Do() spends down (release reads this field)
+		pInfo->bKillTargetCertainly = GetEnemy()->GetHP() * 2.5f < nQuality;
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAIShootAction::Do( CAILog *pLog ) const
+{
+	ASSERT( IsValid( pLog ) );
+	if ( !IsValid( pLog ) )
+		return;
+	//
+	SInfo info;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	CPtr<IAIUnit> pEnemy = GetEnemy();
+	GetInfoInner( GetCurrentPlace(), &info );
+	ASSERT( info.bCanDo );
+	if ( info.bCanDo && IsValid( pUnit ) && IsValid( pEnemy ) && IsValid( info.pWeapon ) && info.nToHit > 0 )
+	{
+		// release @0041cb10: switch to the weapon + shoot-mode ONCE, then log shots while the unit can still
+		// afford one. The AP budget (nAP) is a LOCAL counter decremented per shot. Logged records do NOT mutate
+		// the live unit (they apply only when the commander later executes them), so re-reading pUnit->GetAP()
+		// inside the loop would never decrease -> infinite loop (the "AI freezes on attack, turn never ends" bug).
+		if ( !pUnit->GetAIInventory()->IsCurrentItem( info.pWeapon ) )
+			*pLog << new CAILogChangeWeapon( pUnit, info.pWeapon );
+		*pLog << new CAILogChangeShootMode( pUnit, info.pWeapon, info.shootMode );
+		//
+		// release @0041cb10: the shot budget is the cached info.nAPToSpend (the AP at the chosen place), a
+		// LOCAL counter decremented per shot - re-reading the live unit AP would never decrease (records
+		// apply only when the commander executes them) -> infinite loop.
+		int nAP = info.nAPToSpend;
+		bool bNeedReload;
+		int nAmmo, nShotHP, nShotAP;
+		info.pWeapon->GetShotParameters( pUnit->GetUnitPosition(), pEnemy, (int)info.fCover, nAP, &nShotAP, &nAmmo, &nShotHP, &bNeedReload );
+		// @0x41cb10 -- retail guards the burst on !bNeedReload too: stop the moment GetShotParameters reports the
+		// clip ran dry mid-burst (a reload is owed); the ungated loop could log a shot the engine would not.
+		while ( !bNeedReload && nAmmo > 0 && nShotAP <= nAP )
+		{
+			*pLog << new CAILogShot( pUnit, pEnemy, info.hitLocation );
+			*pLog << new CAILogSpendAP( pUnit, nShotAP );
+			*pLog << new CAILogSpendAmmo( info.pWeapon->GetCurrentClip(), nAmmo );
+			nAP -= nShotAP;
+			info.pWeapon->GetShotParameters( pUnit->GetUnitPosition(), pEnemy, (int)info.fCover, nAP, &nShotAP, &nAmmo, &nShotHP, &bNeedReload );
+		}
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// RETAIL @0x0041cdd0 (oracle: decomp/src/s2_aiattackaction.h, disasm-verified). The release REWROTE
+// this from the Jan03 bCanDo/distance ladder: rank the two firing places by their to-hit, but once BOTH
+// clear the accuracy bar prefer the one that leaves MORE AP -- i.e. the place needing the LEAST movement,
+// so the unit HOLDS POSITION and keeps its aim instead of stepping a tile closer before every shot. The
+// bar is 20, relaxed to 5 only when the unit is "busy" in a panzerklein (release IAIUnit::vtbl+0x20 ==
+// IsUnitBusy == IsInPK; a PK accepts low-percentage shots -- the same slot the place source reads as
+// no-CROUCH / WALK-not-RUN), expressed in-tree by the established IsValid(GetWearingDBPK()) idiom. A
+// non-shootable place has nToHit==0 (SInfo ctor) so it loses to any place clearing the bar -- the release
+// relies on that rather than a bCanDo short-circuit, and does NOT re-test the pose here (the choose-place
+// job already rejects inactive/lay candidates). The previous "tie -> prefer the place CLOSER to the enemy"
+// tie-break was a Jan03-ladder artifact and is what made AI units creep forward / walk up before shooting.
+bool CAIShootAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const
+{
+	int nThreshold = 20;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( IsValid( pUnit ) && IsValid( pUnit->GetUnitServer() ) &&
+		IsValid( pUnit->GetUnitServer()->GetWearingDBPK() ) )
+		nThreshold = 5;   // in a panzerklein -> relax the accuracy bar (release vtbl+0x20)
+	//
+	SInfo info1, info2;
+	GetInfoInner( p1, &info1 );
+	GetInfoInner( p2, &info2 );
+	if ( info1.nToHit < nThreshold || info2.nToHit < nThreshold )
+		return info1.nToHit > info2.nToHit;   // not both good -> rank by accuracy
+	return p1.nUnitAP > p2.nUnitAP;            // both good -> prefer the place needing the least movement
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAIThrowGrenadeAction - enemy-group helpers (carried over verbatim from dev aiAttackAction.cpp)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+static bool IsGoodGroup( NWorld::CUnitServer *pUS, const SUnitPosition &pos, CAIFireArmsWeapon *pLauncher, const SAIUnitGroup &group, CVec3 *pTarget )
+{
+	if ( !IsValid( pLauncher ) )
+		return false;
+	if ( group.fNearestAlly <= 3.0f || group.enemies.empty() )
+		return false;
+	//
+	// CWeaponItem publicly derives NRPG::IWeaponItem - implicit upcast (not CDynamicCast); guard null.
+	NRPG::CWeaponItem *pItem = pLauncher->GetItem();
+	if ( !IsValid( pItem ) )
+		return false;
+	*pTarget = group.ptCenter;
+	if ( NWorld::CanUnitLaunchRocket( pUS, pos, *pTarget, 0, pItem ) != NWorld::UCR_OK )
+	{
+		*pTarget = group.ptCenter + CVec3( 0, 0, 0.6f );
+		CVec3 ptDir = pos.GetCP() - *pTarget;
+		Normalize( &ptDir );
+		*pTarget += ptDir * 1.7f;
+		if ( NWorld::CanUnitLaunchRocket( pUS, pos, *pTarget, 0, pItem ) != NWorld::UCR_OK )
+			return false;
+	}
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+static bool IsGoodGroup( NWorld::CUnitServer *pUS, const SUnitPosition &pos, CAIGrenadeWeapon *pGrenade, const SAIUnitGroup &group, CVec3 *pTarget )
+{
+	if ( !IsValid( pGrenade ) )
+		return false;
+	if ( group.enemies.empty() )
+		return false;
+	//
+	// CGrenadeItem publicly derives NRPG::IGrenadeItem, so pass it via the plain (guaranteed) implicit
+	// upcast - NOT CDynamicCast, which was returning null here and made CanUnitThrowGrenade deref a null
+	// IGrenadeItem (crash on pGrenade->GetDBGrenade()). Guard the null item too, since CanUnitThrowGrenade
+	// does not.
+	NRPG::CGrenadeItem *pItem = pGrenade->GetItem();
+	if ( !IsValid( pItem ) )
+		return false;
+	float fRange = 0;
+	if ( pItem->GetDBGrenade() )
+		fRange = pItem->GetDBGrenade()->fFragmentRange;
+	else if ( pItem->GetDBEngGrenade() )
+		fRange = pItem->GetDBEngGrenade()->fFragmentRange;
+	// Retail 0x41c390: strict clearance, using the DB value without unit conversion.
+	if ( !(fRange < group.fNearestAlly) )
+		return false;
+	NWorld::EUnitCommandResult res = NWorld::CanUnitThrowGrenade( pUS, pos, group.ptCenter, pItem );
+	if ( res != NWorld::UCR_OK )
+		return false;
+	//
+	*pTarget = group.ptCenter;
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+template< class T >
+static int GetNearestGroup( NWorld::CUnitServer *pUS, const SUnitPosition &pos, T *pWeapon, const vector<SAIUnitGroup> &groups, CVec3 *pTarget )
+{
+	int nBestGroup = -1;
+	int nGroup = 0;
+	while ( nGroup < groups.size() )
+	{
+		const SAIUnitGroup &group = groups[ nGroup ];
+		CVec3 ptTarget;
+		if ( IsGoodGroup( pUS, pos, pWeapon, group, &ptTarget ) )
+		{
+			bool bBestGroup = true;
+			if ( nBestGroup >= 0 )
+			{
+				const SAIUnitGroup &bestGroup = groups[ nBestGroup ];
+				CVec3 unitPos = pos.GetCP();
+				float fDistance = fabs2( group.ptCenter - unitPos );
+				float fBestDistance = fabs2( bestGroup.ptCenter - unitPos );
+				if ( !( fDistance < fBestDistance || ( fDistance == fBestDistance && group.enemies.size() > bestGroup.enemies.size() ) ) )
+					bBestGroup = false;
+			}
+			if ( bBestGroup )
+			{
+				nBestGroup = nGroup;
+				*pTarget = ptTarget;
+			}
+		}
+		++nGroup;
+	}
+	return nBestGroup;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+static bool IsBadGroupHealth( const SAIUnitGroup &group )
+{
+	const int N_BAD_HEALTH = 15;
+	vector< CPtr<IAIUnit> >::const_iterator i;
+	int nHealth = 0;
+	for ( i = group.enemies.begin(); i != group.enemies.end(); ++i )
+		nHealth = Max( nHealth, (*i)->GetAP() );
+	return nHealth <= N_BAD_HEALTH;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAIThrowGrenadeAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const
+{
+	pInfo->bCanDo = false;
+	pInfo->bBadGroupHealth = false;
+	pInfo->nTargetSize = 0;
+	// release @0x0041bdd0 guards BOTH the unit (IsValid) AND a non-null AI state up front, before touching
+	// the inventory: CAIUnit::GetAIState is a weak back-pointer that is null for a unit not currently in an
+	// AI state, and GetEnemyGroups() below would null-deref it.
+	CPtr<IAIUnit> pUnit = GetUnit();
+	SAIState *pState = IsValid( pUnit ) ? pUnit->GetAIState() : 0;
+	if ( !IsValid( pUnit ) || pState == 0 )
+		return;
+	pInfo->pGrenade = pUnit->GetAIInventory()->GetBestGrenade( VNULL3 );
+	if ( !IsValid( pInfo->pGrenade ) )
+		return;
+	// affordable from this place? release gates GetActionAP(pose, AC_THROW_GRENADE) <= place AP BEFORE the
+	// (heavier) nearest-group search, so an unaffordable grenade never wins the decision - the turn then
+	// falls through to shoot/advance instead of being spent doing nothing.
+	NRPG::IUnitMission *pMission = pUnit->GetUnitMission();
+	if ( IsValid( pMission ) && pMission->GetActionAP( place.place.GetPose(), NRPG::AC_THROW_GRENADE ) > place.nUnitAP )
+		return;
+	//
+	CVec3 ptTarget;
+	const vector<SAIUnitGroup> &groups = pState->GetEnemyGroups();
+	int nGroup = GetNearestGroup( pUnit->GetUnitServer(), place.place, pInfo->pGrenade.GetPtr(), groups, &ptTarget );
+	if ( nGroup >= 0 )
+	{
+		pInfo->bCanDo = true;
+		const SAIUnitGroup &group = groups[ nGroup ];
+		pInfo->ptTarget = ptTarget;             // throw point (release stores this; Do throws at it)
+		pInfo->nTargetSize = group.enemies.size();
+		pInfo->bBadGroupHealth = IsBadGroupHealth( group );
+		pInfo->nAPToSpend = place.nUnitAP;
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAIThrowGrenadeAction::Do( CAILog *pLog ) const
+{
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( !IsValid( pLog ) )
+		return;
+	//
+	SInfo info;
+	GetInfoInner( GetCurrentPlace(), &info );
+	ASSERT( info.bCanDo );
+	if ( info.bCanDo )
+	{
+		CPtr<CAIGrenadeWeapon> pGrenade = info.pGrenade;
+		NAI::EPose pose = pUnit->GetUnitPosition().GetPose();
+		int nGrenadeThrowAP = pUnit->GetUnitMission()->GetActionAP( pose, NRPG::AC_THROW_GRENADE );
+		// @0x0041ceb0 -- the throw budget is the cached info.nAPToSpend (the AP at the chosen place), a LOCAL
+		// counter decremented per throw. Logged records do NOT mutate the live unit (they apply only when the
+		// commander later executes them), so re-reading pUnit->GetAP() inside the loop would never decrease and
+		// GetBestGrenade would keep returning the same grenade -> infinite loop (the "AI freezes on attack, turn
+		// never ends" bug, same fix as CAIShootAction::Do above).
+		while ( IsValid( pGrenade ) && info.nAPToSpend >= nGrenadeThrowAP )
+		{
+			if ( !pUnit->GetAIInventory()->IsCurrentItem( pGrenade ) )
+				*pLog << new CAILogChangeWeapon( pUnit, pGrenade );
+			*pLog << new CAILogThrowGrenade( pUnit, info.ptTarget, pGrenade );   // cached throw point (release SInfo field)
+			*pLog << new CAILogSpendAP( pUnit, nGrenadeThrowAP );
+			info.nAPToSpend -= nGrenadeThrowAP;
+			pGrenade = pUnit->GetAIInventory()->GetBestGrenade( VNULL3 );
+		}
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CAIThrowGrenadeAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const
+{
+	// @0x0041b980 -- the RETAIL rewrite DROPS the Jan03 bCanDo/fDistance ladder (and the two heavy
+	// GetInfoInner doability scans the comparator used to run): it is a pure "more AP left wins"
+	// leaf comparator. Doability is filtered separately by CanDo; ComparePlaces only ranks by AP.
+	// Decomp: return p2.nUnitAP < p1.nUnitAP.
+	return p2.nUnitAP < p1.nUnitAP;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAILaunchRocketAction
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAILaunchRocketAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const
+{
+	CPtr<IAIUnit> pUnit = GetUnit();
+	pInfo->bCanDo = false;
+	pInfo->bBadGroupHealth = false;
+	pInfo->nTargetSize = 0;
+	// same up-front guard as the grenade action: a null AI-state weak back-pointer would null-deref at the
+	// GetEnemyGroups() below (the combat logic only runs for AI-controlled units that are in a state).
+	SAIState *pState = IsValid( pUnit ) ? pUnit->GetAIState() : 0;
+	if ( !IsValid( pUnit ) || pState == 0 )
+		return;
+	//
+	pInfo->pWeapon = pUnit->GetAIInventory()->GetBestRocketLaunchers();
+	if ( !IsValid( pInfo->pWeapon ) )
+		return;
+	if ( pInfo->pWeapon->GetCurrentClip()->GetAmmoCount() <= 0 )
+		return;   // empty launcher: not do-able (release SInfo has no bNeedReload; reloading is the reload action's job)
+	// @0x1c940 - affordability gate (release-NEW vs dev): the launch-rocket AP cost must fit place.nUnitAP BEFORE
+	// the (heavier) nearest-group search, so an unaffordable rocket never wins the decision (mirrors the grenade
+	// twin's pre-search GetActionAP gate above). In-tree the launch cost is the weapon's GetShotAP() - the same AP
+	// Do() spends - because there is no AC_LAUNCH_ROCKET action code in RPGUnitInfo.h for GetActionAP(pose,6,weapon).
+	if ( pInfo->pWeapon->GetShotAP() > place.nUnitAP )
+		return;
+	//
+	const vector<SAIUnitGroup> &groups = pState->GetEnemyGroups();
+	int nGroup = GetNearestGroup( pUnit->GetUnitServer(), place.place, pInfo->pWeapon.GetPtr(), groups, &pInfo->ptTarget );
+	if ( nGroup >= 0 )
+	{
+		const SAIUnitGroup &group = groups[ nGroup ];
+		pInfo->bCanDo = true;
+		pInfo->nTargetSize = group.enemies.size();
+		pInfo->bBadGroupHealth = IsBadGroupHealth( group );
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAILaunchRocketAction::Do( CAILog *pLog ) const
+{
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( !IsValid( pLog ) || !IsValid( pUnit ) )
+		return;
+	SInfo info;
+	GetInfoInner( GetCurrentPlace(), &info );
+	if ( !info.bCanDo || !IsValid( info.pWeapon ) )   // GetInfoInner now leaves bCanDo=false for an empty launcher
+		return;
+	if ( !pUnit->GetAIInventory()->IsCurrentItem( info.pWeapon ) )
+		*pLog << new CAILogChangeWeapon( pUnit, info.pWeapon );
+	*pLog << new CAILogChangeShootMode( pUnit, info.pWeapon, NDb::SM_Snap );
+	*pLog << new CAILogShotPoint( pUnit, info.ptTarget );
+	*pLog << new CAILogSpendAP( pUnit, info.pWeapon->GetShotAP() );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CAILaunchRocketAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const
+{
+	// @0x1b9a0 (image 0x0041b9a0) - RETAIL REWRITE: the release dropped the dev bCanDo/distance ladder and
+	// ranks the two places PURELY by remaining AP (no GetInfoInner calls). p1 strictly outranks p2 iff it leaves
+	// more AP; ties (==) yield false (strict weak order). Follow the decomp, not the Jan03 ladder.
+	return p2.nUnitAP < p1.nUnitAP;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Support actions (reconstruction/exports/actions_support.c). NOTE on dependencies still to port:
+// release CAIInventory adds GetBestWeaponForReload/GetBestFirstAid/GetBestMeleeWeapon/GetBestThrowingWeapon;
+// release weapon types CAIFireArmsWeaponBase/CAIFirstAid/CAIMeleeWeapon/CAIThrowingWeapon; release-new log
+// records Heal/Melee/ThrowKnife (the release uses CreateAILog* factories - here `new CAILog*` on the dev
+// records where present). GetActionAP takes (pose, AC, weaponLen) in the release; the 2-arg dev form +
+// the AC code are used below and reconciled in the build-settle.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAIReloadAction @0x0041c0d0/0x0041d2a0/0x0041b9c0
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAIReloadAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const   // @0x0041c0d0
+{
+	pInfo->bCanDo = false;
+	pInfo->pWeapon = 0;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( !IsValid( pUnit ) || !IsValid( pUnit->GetAIInventory() ) )
+		return;
+	// can't reload from an inactive pose (release gates on the pose category bits)
+	if ( ( place.place.GetPose() & 0xc000 ) == 0xc000 )
+		return;
+	CAIFireArmsWeapon *pWeapon = pUnit->GetAIInventory()->GetBestWeaponForReload();
+	pInfo->pWeapon = pWeapon;
+	if ( IsValid( pWeapon ) )
+	{
+		// affordable from this place? release computes GetActionAP(pose, AC_RELOAD, weaponLen); the dev
+		// firearm exposes the equivalent reload cost via GetReloadAP(). @addr (pose-dependence elided)
+		if ( pWeapon->GetReloadAP() <= place.nUnitAP )
+			pInfo->bCanDo = true;
+	}
+}
+void CAIReloadAction::Do( CAILog *pLog ) const   // @0x0041d2a0
+{
+	ASSERT( IsValid( pLog ) );
+	if ( !IsValid( pLog ) )
+		return;
+	SInfo info;
+	GetInfoInner( GetCurrentPlace(), &info );
+	if ( !info.bCanDo || !IsValid( info.pWeapon ) )
+		return;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( !IsValid( pUnit ) || !IsValid( pUnit->GetAIInventory() ) )
+		return;
+	if ( !pUnit->GetAIInventory()->IsCurrentItem( info.pWeapon ) )
+		*pLog << new CAILogChangeWeapon( pUnit, info.pWeapon );
+	*pLog << new CAILogReloadWeapon( pUnit, info.pWeapon );
+	*pLog << new CAILogSpendAP( pUnit, info.pWeapon->GetReloadAP() );
+}
+bool CAIReloadAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const
+{
+	return p2.nUnitAP < p1.nUnitAP;   // prefer the place with more AP left
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAIHealAction @0x00451ae0/0x00451c90/0x00451a50
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAIHealAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const   // @0x00451ae0
+{
+	pInfo->bCanDo = false;
+	pInfo->pFirstAid = 0;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( !IsValid( pUnit ) )
+		return;
+	pInfo->pFirstAid = pUnit->GetAIInventory()->GetBestFirstAid();
+	if ( !IsValid( pInfo->pFirstAid ) )
+		return;
+	// only heal when badly hurt: currentHP <= 30% of max (release @0x00451ae0).
+	if ( (float)pUnit->GetHP() > pUnit->GetMaxHP() * 0.3f )
+		return;
+	// not while the current enemy is close (release: bail if the enemy is within ~4 units).
+	CPtr<IAIUnit> pEnemy = GetEnemy();
+	if ( IsValid( pEnemy ) && fabs( pEnemy->GetPosition().GetCP() - pUnit->GetPosition().GetCP() ) < 4.0f )
+		return;
+	// Retail 0x452206 / 0x6c1253: price the selected kit, not the item in hand.
+	if ( pInfo->pFirstAid->GetItem()->GetDBFirstAid()->nAPToUse > place.nUnitAP )
+		return;
+	// world allows first-aid here (self target)?
+	if ( NWorld::CanDoFirstAid( pUnit->GetUnitServer(), place.place, pUnit->GetUnitServer(),
+		place.place, pInfo->pFirstAid->GetItem() ) == NWorld::UCR_OK )
+		pInfo->bCanDo = true;
+}
+void CAIHealAction::Do( CAILog *pLog ) const   // @0x00451c90
+{
+	if ( !IsValid( pLog ) )
+		return;
+	SInfo info;
+	GetInfoInner( GetCurrentPlace(), &info );
+	if ( !info.bCanDo || !IsValid( info.pFirstAid ) )
+		return;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( !IsValid( pUnit ) )
+		return;
+	if ( !pUnit->GetAIInventory()->IsCurrentItem( info.pFirstAid ) )
+		*pLog << new CAILogChangeWeapon( pUnit, info.pFirstAid );
+	*pLog << new CAILogHeal( pUnit, pUnit );   // self-heal
+	*pLog << new CAILogSpendAP( pUnit, info.pFirstAid->GetItem()->GetDBFirstAid()->nAPToUse );
+}
+bool CAIHealAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const
+{
+	bool b1Crouch = ( p1.place.GetPose() == CROUCH ), b2Crouch = ( p2.place.GetPose() == CROUCH );
+	if ( b1Crouch && !b2Crouch ) return true;     // prefer crouching to heal
+	if ( !b1Crouch && b2Crouch ) return false;
+	return p2.nUnitAP < p1.nUnitAP;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAIMeleeAction @0x0041c3d0/0x0041d5b0/0x0041ba00
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAIMeleeAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const   // @0x0041c3d0
+{
+	pInfo->bCanDo = false;
+	pInfo->pWeapon = 0;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	CPtr<IAIUnit> pEnemy = GetEnemy();
+	if ( !IsValid( pUnit ) || !IsValid( pEnemy ) )
+		return;
+	pInfo->pWeapon = pUnit->GetAIInventory()->GetBestMeleeWeapon();
+	if ( !IsValid( pInfo->pWeapon ) )
+		return;
+	// affordable from this place? (release: GetActionAP(pose, AC_MELEE, weaponLen) <= place AP; the dev
+	// 2-arg GetActionAP elides the weapon length, as the grenade/reload actions already do.)
+	NRPG::IUnitMission *pMission = pUnit->GetUnitMission();
+	if ( IsValid( pMission ) && pMission->GetActionAP( place.place.GetPose(), NRPG::AC_MELEE ) > place.nUnitAP )
+		return;
+	// enemy within melee reach of this place? (release computes the enemy's collider point; the enemy
+	// centre is a faithful stand-in for the F_MELEE_DISTANCE test.)
+	if ( NWorld::IsWithinHumanReach( place.place.GetCP(), pEnemy->GetPosition().GetCP(), F_MELEE_DISTANCE ) )
+		pInfo->bCanDo = true;
+}
+void CAIMeleeAction::Do( CAILog *pLog ) const   // @0x0041d5b0
+{
+	if ( !IsValid( pLog ) )
+		return;
+	SInfo info;
+	GetInfoInner( GetCurrentPlace(), &info );
+	if ( !info.bCanDo || !IsValid( info.pWeapon ) )
+		return;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	CPtr<IAIUnit> pEnemy = GetEnemy();
+	if ( !IsValid( pUnit ) || !IsValid( pEnemy ) )
+		return;
+	if ( !pUnit->GetAIInventory()->IsCurrentItem( info.pWeapon ) )
+		*pLog << new CAILogChangeWeapon( pUnit, info.pWeapon );
+	*pLog << new CAILogSpendAP( pUnit, pUnit->GetUnitMission()->GetActionAP( pUnit->GetUnitPosition().GetPose(), NRPG::AC_MELEE ) );
+	// the strike: retail logs a dedicated CAILogMelee record carrying the melee weapon; its GetCommands
+	// @0x460d20 emits CCmdShootObject( pEnemy->GetUnitServer(), 0, HL_HEAD ) -- the same attack-object command
+	// CAILogShot would, but the weapon is preserved for save-format fidelity. @0x41d5b0 CreateAILogMelee passes
+	// hitLoc=1 (HL_HEAD), NOT pinned to HL_ANY like the throw-knife sibling.
+	*pLog << new CAILogMelee( pUnit, pEnemy, info.pWeapon, HL_HEAD );
+}
+bool CAIMeleeAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const
+{
+	return p2.nUnitAP < p1.nUnitAP;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAIThrowKnifeAction @0x0041c210/0x0041d420/0x0041b9e0 - GetInfoInner/Do parallel melee (throwing
+// weapon + CanUnitThrow reach check + a ThrowKnife record). Body reconstructed structurally; the exact
+// throw-reach gate is in the decompile @0x0041c210.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAIThrowKnifeAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const   // @0x0041c210
+{
+	pInfo->bCanDo = false;
+	pInfo->pWeapon = 0;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	CPtr<IAIUnit> pEnemy = GetEnemy();
+	SAIState *pState = IsValid( pUnit ) ? pUnit->GetAIState() : 0;
+	if ( !IsValid( pUnit ) || !IsValid( pEnemy ) || pState == 0 )
+		return;
+	pInfo->pWeapon = pUnit->GetAIInventory()->GetBestThrowingWeapon();
+	if ( !IsValid( pInfo->pWeapon ) )
+		return;
+	NRPG::IUnitMission *pMission = pUnit->GetUnitMission();
+	if ( IsValid( pMission ) && pMission->GetActionAP( place.place.GetPose(), NRPG::AC_THROW_KNIFE ) > place.nUnitAP )
+		return;
+	// the knife's RPG item as IMeleeWeaponItem (CMeleeWeaponItem publicly derives it -> plain upcast, not
+	// CDynamicCast; CanUnitThrowKnife does the throw line-of-fire/range check).
+	NRPG::CMeleeWeaponItem *pItem = pInfo->pWeapon->GetItem();
+	if ( !IsValid( pItem ) )
+		return;
+	if ( NWorld::CanUnitThrowKnife( pUnit->GetUnitServer(), place.place, pEnemy->GetPosition().GetCP(), pItem ) == NWorld::UCR_OK )
+		pInfo->bCanDo = true;
+}
+void CAIThrowKnifeAction::Do( CAILog *pLog ) const   // @0x0041d420
+{
+	if ( !IsValid( pLog ) )
+		return;
+	SInfo info;
+	GetInfoInner( GetCurrentPlace(), &info );
+	if ( !info.bCanDo || !IsValid( info.pWeapon ) )
+		return;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	CPtr<IAIUnit> pEnemy = GetEnemy();
+	if ( !IsValid( pUnit ) || !IsValid( pEnemy ) )
+		return;
+	if ( !pUnit->GetAIInventory()->IsCurrentItem( info.pWeapon ) )
+		*pLog << new CAILogChangeWeapon( pUnit, info.pWeapon );
+	*pLog << new CAILogSpendAP( pUnit, pUnit->GetUnitMission()->GetActionAP( pUnit->GetUnitPosition().GetPose(), NRPG::AC_THROW_KNIFE ) );
+	// @0x0041d420 -- retail emits CAILogThrowKnife (NOT CAILogShot). The WORLD COMMAND is identical
+	// (CAILogThrowKnife::GetCommands @0x460c30 pins eHL = -1/HL_ANY, exactly like CAILogShot(pEnemy,HL_ANY)),
+	// but CAILogThrowKnife ALSO carries the thrown knife so its Commit (retail ModifyState @0x45c7f0) removes
+	// the knife from the AI inventory and empties the hand -- the simulated-state effect CAILogShot (base
+	// no-op Commit) silently dropped.
+	*pLog << new CAILogThrowKnife( pUnit, pEnemy, info.pWeapon, HL_ANY );
+}
+bool CAIThrowKnifeAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const
+{
+	return p2.nUnitAP < p1.nUnitAP;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAIMoveToEnemyAction @0x00475110/0x00475030/0x00475040 - the place-move IS the effect (logged by
+// CAICombatLogic::DoAction); the action's own Do() is empty.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAIMoveToEnemyAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const
+{
+	// @0x00475110 - can advance iff the unit is alive AND the candidate place is a DIFFERENT tile than
+	// where the unit already stands. Masked tile compare (mask 0x1feffff, == NAI::IsSamePlace @0x00473da0:
+	// (a&mask)==(b&mask)) ignores the pose/direction/moving bits. The move itself is emitted by
+	// CAICombatLogic::DoAction; GetInfoInner only gates it. Retail checks NEITHER an enemy nor a weapon --
+	// the old GetEnemy()/HasAnyWeapon() gate was a dev interpretation that never matched the decode.
+	pInfo->bCanDo = false;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( !IsValid( pUnit ) )
+		return;
+	const int nCur  = pUnit->GetUnitPosition().pos.p.GetData();   // unit's current tile (vtbl +0xc GetUnitPosition)
+	const int nDest = place.place.pos.p.GetData();                // the candidate place's tile
+	if ( ( ( nCur ^ nDest ) & 0x1feffff ) != 0 )                 // tiles differ -> the move is do-able
+		pInfo->bCanDo = true;
+}
+void CAIMoveToEnemyAction::Do( CAILog *pLog ) const
+{
+	// empty - the move to the chosen place is emitted by CAICombatLogic::DoAction. @0x00475030
+}
+bool CAIMoveToEnemyAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const
+{
+	return p2.nUnitAP < p1.nUnitAP;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAILootAction @0x00463210/0x00463a80/0x004631c0 - GetInfoInner walks nearby frozen items, keeps the
+// ones CAIInventory::IsItemNecessary wants (+ computes the items to drop to make room); Do logs the
+// pickups/drops. GetInfoInner + Do are reconstructed in aiLootAction.cpp. ComparePlaces prefers more AP.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CAILootAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const
+{
+	return p2.nUnitAP < p1.nUnitAP;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// The whole snipe state machine (CAIBeginSnipeAction / CAICollectSnipeAPAction / CAISnipeShotAction /
+// CAICancelSnipeAction -- GetInfoInner + Do) is reconstructed in aiSnipeAction.cpp; the heavy-gun (cannon)
+// actions in aiHeavyGunAction.cpp. Their ComparePlaces + saveload registration stay below.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAIWearPKAction - climb into the best reachable free panzerklein. Reconstructed from the matched-
+// release decode (oracle: decomp/src/s2_aipkaction.h: GetInfoInner @0x0048d8b0, Do @0x0048dd10).
+// Scans every unit server for candidate suits: empty suits with a live hull (IsEmptyPK + IsAddedToVisitor
+// + HP != 0) are preferred; occupied suits whose pilot cannot fight come after. With the unit's wish-pose
+// temporarily forced to RUN (reachability judged as if running), the first candidate with positive HP the
+// unit can reach + take (CanDo(CCmdTakeCorpse) == UCR_OK) wins. Hook resolution: the suit-server wish-pose
+// scratch (+0x28) is CDumbUnitServer::Get/SetWishPose, the run byte (+0x24) is Set/IsStrafing, the
+// candidate HP is its RPG unit's ST_VP, the corpse mounted is the suit cast to NWorld::CUnit.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+static int WearPK_SuitHP( NWorld::CUnitServer *pS )
+{
+	NRPG::IUnitMissionInfo *pRPG = pS->GetRPG();
+	NRPG::CUnit *pUnit = IsValid( pRPG ) ? pRPG->GetRPGUnit() : 0;
+	return IsValid( pUnit ) ? (int)pUnit->Skills( NDb::ST_VP ) : 0;
+}
+void CAIWearPKAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const   // @0x0048d8b0
+{
+	pInfo->bCanDo = false;
+	pInfo->pPK = 0;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( !IsValid( pUnit ) )
+		return;
+	NWorld::CUnitServer *pUS = pUnit->GetUnitServer();
+	if ( !IsValid( pUS ) )
+		return;
+	// already wearing a live PK -> nothing to climb into.
+	if ( IsValid( pUS->GetWearingDBPK() ) )
+		return;
+	NWorld::CWorld *pWorld = pUS->GetWorld();
+	if ( !IsValid( pWorld ) )
+		return;
+	list< CPtr<NWorld::CUnitServer> > all;
+	pWorld->GetAllUnits( &all );
+	vector< NWorld::CUnitServer* > cands;    // empty suits (preferred)
+	vector< NWorld::CUnitServer* > pilots;   // occupied suits whose pilot cannot fight
+	for ( list< CPtr<NWorld::CUnitServer> >::iterator it = all.begin(); it != all.end(); ++it )
+	{
+		NWorld::CUnitServer *pS = it->GetPtr();
+		if ( !IsValid( pS ) )
+			continue;
+		bool bEmpty = pS->IsEmptyPK();
+		if ( bEmpty && pS->IsAddedToVisitor() && WearPK_SuitHP( pS ) != 0 )
+		{
+			cands.push_back( pS );
+			continue;
+		}
+		if ( !bEmpty && IsValid( pS->GetWearingDBPK() ) && !pS->CanFight() )
+			pilots.push_back( pS );
+	}
+	for ( int i = 0; i < (int)pilots.size(); ++i )
+		cands.push_back( pilots[i] );
+	if ( cands.empty() )
+		return;
+	// judge reachability as if the unit runs to the suit.
+	NAI::EPose oldPose = pUS->GetWishPose();
+	pUS->SetWishPose( NAI::RUN );
+	for ( int i = 0; i < (int)cands.size(); ++i )
+	{
+		CObj<NWorld::CCmd> cmd = new NWorld::CCmdTakeCorpse( (NWorld::CUnit*)cands[i] );
+		if ( WearPK_SuitHP( cands[i] ) > 0 && pUS->CanDo( cmd.GetPtr() ) == NWorld::UCR_OK )
+		{
+			pInfo->bCanDo = true;
+			pInfo->pPK = cands[i];
+			break;
+		}
+	}
+	pUS->SetWishPose( oldPose );
+	if ( oldPose == NAI::CRAWL )            // restoring CRAWL also clears the run byte
+		pUS->SetStrafe( false );
+}
+void CAIWearPKAction::Do( CAILog *pLog ) const   // @0x0048dd10
+{
+	if ( !IsValid( pLog ) )
+		return;
+	SInfo info;
+	GetInfoInner( GetCurrentPlace(), &info );
+	NWorld::CUnitServer *pPK = info.pPK.GetPtr();
+	if ( !info.bCanDo || !IsValid( pPK ) )
+		return;
+	SPlaceWithAP fresh = GetCurrentPlace();
+	// normalise the pose to RUN at the current place, then mount the suit.
+	*pLog << new CAILogPosition( GetUnit(), GetUnit()->GetPosition(), fresh.place.pos, NAI::RUN );
+	*pLog << new CAILogWearPK( GetUnit(), pPK );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAITerrorPKAction - in a dying panzerklein, walk into the thick of the nearest enemy group (the
+// terror weapon works by proximity in the world layer). Reconstructed from the matched-release decode
+// (oracle: decomp/src/s2_aiterrorpkaction.h: GetInfoInner @0x004aa420, Do @0x004aa770). Hook
+// resolution: the decode's IsUnitBusy gate is the release IAIUnit::IsInPK (DIA-confirmed @0x4ad4f0 ==
+// valid unit-server wearing a live PK record); the suit-HP read is the suit-server RPG unit's ST_VP
+// skill (current via operator int, max via GetMaxValue); enemy-group centroids come from
+// SAIState::GetEnemyGroups; the rampage target is GetUnitPos(GetNearestPosition(centroid)).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAITerrorPKAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const   // @0x004aa420
+{
+	pInfo->bCanDo = false;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( !IsValid( pUnit ) )
+		return;
+	NWorld::CUnitServer *pUS = pUnit->GetUnitServer();
+	if ( !IsValid( pUS ) )
+		return;
+	// IsInPK gate (release IAIUnit::IsInPK == valid unit-server wearing a live PK record).
+	if ( !IsValid( pUS->GetWearingDBPK() ) )
+		return;
+	NWorld::CUnitServer *pPK = pUS->GetWearingPK();
+	if ( !IsValid( pPK ) )
+		return;
+	if ( !IsValid( pUS->GetWearingDBPK() ) )           // the binary re-checks the worn record here
+		return;
+	// the rampage is a DESPERATION move: only once the suit is hurt to <= 25% of its max HP.
+	NRPG::IUnitMissionInfo *pRPG = pPK->GetRPG();
+	NRPG::CUnit *pRPGUnit = IsValid( pRPG ) ? pRPG->GetRPGUnit() : 0;
+	if ( !IsValid( pRPGUnit ) )
+		return;
+	int nMax = pRPGUnit->Skills( NDb::ST_VP ).GetMaxValue();
+	int nCur = pRPGUnit->Skills( NDb::ST_VP );           // CDynamicSkill::operator int() == current
+	if ( (float)nMax * 0.25f < (float)nCur )
+		return;   // still healthy -> no rampage yet
+	// walk into the nearest enemy group, unless already standing in it (< 1.0 m^2 away).
+	CVec3 cp = pUnit->GetPosition().GetCP();
+	SAIState *pState = pUnit->GetAIState();
+	if ( !IsValid( pState ) )
+		return;
+	const vector<SAIUnitGroup> &groups = pState->GetEnemyGroups();
+	int nBest = -1;
+	float fBest = 65535.0f;
+	for ( int i = 0; i < (int)groups.size(); ++i )
+	{
+		const CVec3 &c = groups[i].ptCenter;
+		float fDX = cp.x - c.x, fDY = cp.y - c.y, fDZ = cp.z - c.z;
+		float fSq = fDX * fDX + fDY * fDY + fDZ * fDZ;
+		if ( fSq < fBest )
+		{
+			fBest = fSq;
+			nBest = i;
+		}
+	}
+	if ( nBest < 0 || fBest < 1.0f )
+		return;   // no group, or already standing in it
+	NWorld::CWorld *pWorld = pUS->GetWorld();
+	if ( !IsValid( pWorld ) )
+		return;
+	NAI::IPathNetwork *pNet = pWorld->GetPathNetwork();
+	const CVec3 &ptCenter = groups[nBest].ptCenter;
+	SPosition nearPos = GetNearestPosition( ptCenter, pNet, false, ptCenter );
+	pInfo->place = GetUnitPos( nearPos.p, pNet );
+	pInfo->bCanDo = true;
+}
+void CAITerrorPKAction::Do( CAILog *pLog ) const   // @0x004aa770
+{
+	if ( !IsValid( pLog ) )
+		return;
+	SInfo info;
+	GetInfoInner( GetCurrentPlace(), &info );
+	if ( info.bCanDo )
+		*pLog << new CAILogPosition( GetUnit(), GetUnit()->GetPosition(), info.place.pos, NAI::WALK );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAILeavePKAction - climb out of the worn panzerklein once it is broken. Reconstructed from the
+// matched-release decode (oracle: decomp/src/s2_aipkaction.h: GetInfoInner @0x0048d680, Do
+// @0x0048d820). SInfo stays minimal {bCanDo}. The decode's opaque suit-HP reach (the suit-server's
+// own HP skill, "< 1" => broken) is expressed in-tree as its RPG unit's ST_VP current value (the
+// engine's current-HP skill, the same getter the dev HP path uses).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAILeavePKAction::GetInfoInner( const SPlaceWithAP &place, SInfo *pInfo ) const   // @0x0048d680
+{
+	pInfo->bCanDo = false;
+	CPtr<IAIUnit> pUnit = GetUnit();
+	if ( !IsValid( pUnit ) )
+		return;
+	NWorld::CUnitServer *pUS = pUnit->GetUnitServer();
+	if ( !IsValid( pUS ) )
+		return;
+	// must be wearing a live panzerklein (DB record + worn suit-server both alive).
+	if ( !IsValid( pUS->GetWearingDBPK() ) )
+		return;
+	NWorld::CUnitServer *pPK = pUS->GetWearingPK();
+	if ( !IsValid( pPK ) )
+		return;
+	// climb out once the suit's own current HP has dropped below 1 (the suit is broken).
+	NRPG::IUnitMissionInfo *pRPG = pPK->GetRPG();
+	NRPG::CUnit *pRPGUnit = IsValid( pRPG ) ? pRPG->GetRPGUnit() : 0;
+	if ( IsValid( pRPGUnit ) && (int)pRPGUnit->Skills( NDb::ST_VP ) < 1 )
+		pInfo->bCanDo = true;
+}
+void CAILeavePKAction::Do( CAILog *pLog ) const   // @0x0048d820
+{
+	if ( !IsValid( pLog ) )
+		return;
+	SInfo info;
+	GetInfoInner( GetCurrentPlace(), &info );
+	if ( info.bCanDo )
+		*pLog << new CAILogLeavePK( GetUnit() );
+}
+//
+// BeginSnipe prefers a crouched place, then more AP (@0x004a4120); the others prefer more AP.
+bool CAIBeginSnipeAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const
+{
+	if ( p1.place.GetPose() == CROUCH && p2.place.GetPose() != CROUCH )
+		return true;
+	return p2.nUnitAP < p1.nUnitAP;
+}
+bool CAICollectSnipeAPAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const { return p2.nUnitAP < p1.nUnitAP; }
+bool CAISnipeShotAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const { return p2.nUnitAP < p1.nUnitAP; }
+bool CAICancelSnipeAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const { return p2.nUnitAP < p1.nUnitAP; }
+bool CAIDockWithHGAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const { return p2.nUnitAP < p1.nUnitAP; }
+bool CAIUndockFromHGAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const { return p2.nUnitAP < p1.nUnitAP; }
+bool CAIShootFromHGAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const { return p2.nUnitAP < p1.nUnitAP; }
+bool CAITerrorPKAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const { return p2.nUnitAP < p1.nUnitAP; }
+bool CAIWearPKAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const { return p2.nUnitAP < p1.nUnitAP; }
+bool CAILeavePKAction::ComparePlaces( const SPlaceWithAP &p1, const SPlaceWithAP &p2 ) const { return p2.nUnitAP < p1.nUnitAP; }
+////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+//
+using namespace NAI;
+//
+REGISTER_SAVELOAD_CLASS( 0x51313110, CAIShootAction )
+REGISTER_SAVELOAD_CLASS( 0x51313120, CAIThrowGrenadeAction )
+REGISTER_SAVELOAD_CLASS( 0x51413180, CAILaunchRocketAction )
+REGISTER_SAVELOAD_CLASS( 0x51833160, CAIReloadAction )
+REGISTER_SAVELOAD_CLASS( 0x53133140, CAIHealAction )
+REGISTER_SAVELOAD_CLASS( 0x52533169, CAIMeleeAction )
+REGISTER_SAVELOAD_CLASS( 0x52533161, CAIThrowKnifeAction )
+REGISTER_SAVELOAD_CLASS( 0x50843170, CAIMoveToEnemyAction )
+REGISTER_SAVELOAD_CLASS( 0x52633180, CAILootAction )
+REGISTER_SAVELOAD_CLASS( 0x52253070, CAIBeginSnipeAction )
+REGISTER_SAVELOAD_CLASS( 0x52253071, CAICollectSnipeAPAction )
+REGISTER_SAVELOAD_CLASS( 0x52253072, CAISnipeShotAction )
+REGISTER_SAVELOAD_CLASS( 0x52253073, CAICancelSnipeAction )
+REGISTER_SAVELOAD_CLASS( 0x2305DC40, CAIDockWithHGAction )
+REGISTER_SAVELOAD_CLASS( 0x2305DC41, CAIUndockFromHGAction )
+REGISTER_SAVELOAD_CLASS( 0x2305DC42, CAIShootFromHGAction )
+REGISTER_SAVELOAD_CLASS( 0x23061400, CAITerrorPKAction )
+REGISTER_SAVELOAD_CLASS( 0x23069AC0, CAIWearPKAction )
+REGISTER_SAVELOAD_CLASS( 0x230724C0, CAILeavePKAction )

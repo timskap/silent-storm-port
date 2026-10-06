@@ -1,0 +1,240 @@
+#include "StdAfx.h"
+#include "GView.h"
+#include "G2DView.h"
+#include "wInterface.h"
+#include "RPGUnitInfo.h"
+#include "..\DBFormat\DataFormat.h"
+#include "..\DBFormat\DataInterface.h"
+#include "..\DBFormat\DataMap.h"		// NDb::EDiplomacyState / DS_ENEMY for the ally/enemy turn split
+#include "Sound.h"
+#include "iMission.h"
+#include "Interface.h"
+#include "iCommonUI.h"
+#include "scFlowChartItems.h"	// NScenario::CScenarioZone -- the objectives-button gate (retail @0x24d670)
+#include "iTopPanel.h"
+#include "..\Misc\StrProc.h"
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NUI
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+const int
+	N_FLASH_TIME = 3000,
+	N_LEAVEZONE_UPDATE_PERIOD = 500;	// CanLeaveZone/tooltip refresh throttle (retail @0x24d010: 0x1f4)
+enum EEndMissionButtonState
+{
+	EENDMISSTATE_OK,
+	EENDMISSTATE_WARNING,
+	EENDMISSTATE_UNAVAILABLE
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CAITurnProgressBar (retail @0x24cf60) -- one instance per AI side (ally + enemy); bAllies tags
+// which side it represents, the parent CTopBar decides which one is visible.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CAITurnProgressBar: public CWindow
+{
+	OBJECT_BASIC_METHODS(CAITurnProgressBar)
+private:
+	ZDATA_(CWindow)
+	bool bAllies;
+	CPtr<NGame::IMission> pMission;
+	CPtr<CProgressBar> pBar;
+	// retail @0x24e4e0: {1 CWindow base, 2 bAllies(1B), 3 pMission, 4 pBar}. Dev had 2/3 SWAPPED ->
+	// loading a retail save read the 1-byte bAllies chunk as the pMission ref -> null pMission ->
+	// AV in Draw the first time the enemy-turn bar went visible (give-away-turn crash).
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CWindow*)this); f.Add(2,&bAllies); f.Add(3,&pMission); f.Add(4,&pBar); return 0; }
+
+public:
+	CAITurnProgressBar() {}
+	CAITurnProgressBar( const SWindowInfo &sInfo, NGame::IMission *pMission, bool bAllies );
+
+	bool ProcessMessage( const SEvent &sEvent );
+	void Draw( const STime &sTime, NGScene::I2DGameView *pView );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CAITurnProgressBar::CAITurnProgressBar( const SWindowInfo &sInfo, NGame::IMission *_pMission, bool _bAllies ):
+	CWindow( sInfo ), pMission( _pMission ), bAllies( _bAllies )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CAITurnProgressBar::ProcessMessage( const SEvent &sEvent )
+{
+	switch( sEvent.nEvent )
+	{
+	case EVENT_TEMPLATELOADCOMPLETE:
+		{
+			pBar = GetUIWindow<CProgressBar>( this, "bar" );
+			break;
+		}
+	}
+
+	return CWindow::ProcessMessage( sEvent );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CAITurnProgressBar::Draw( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	if ( !GetStyle( STYLE_VISIBLE ) )
+		return;
+
+	pBar->SetValue( 1.0f );
+
+	if ( pMission->GetActivePlayer()->GetPlayer() == pMission->GetWorld()->GetCurrentPlayer() )
+		return;
+
+	int nValue = 0, nMaxValue = 0;
+	CPtr<NWorld::IPlayer> pEnemyPlayer = pMission->GetWorld()->GetCurrentPlayer();
+	vector< CPtr<NWorld::CUnit> > playerUnitsSet;
+	pEnemyPlayer->GetUnits( &playerUnitsSet );
+	for ( int nTemp = 0; nTemp < playerUnitsSet.size(); nTemp++ )
+	{
+		NRPG::SUnitInfo sInfo;
+		playerUnitsSet[nTemp]->GetInfo( &sInfo );
+
+		nValue += sInfo.nAP;
+		nMaxValue += sInfo.nMaxAP;
+	}
+
+	pBar->SetValue( (float)( nMaxValue - nValue) / nMaxValue );
+
+	CWindow::Draw( sTime, pView );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CTopBar
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CTopBar::CTopBar( const SWindowInfo &sInfo, NGame::IMission *_pMission ):
+	CWindow( sInfo ), pMission( _pMission ), eMode( NONE ), sModeTime( 0 )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CTopBar::ProcessMessage( const SEvent &sEvent )
+{
+	switch( sEvent.nEvent )
+	{
+	case EVENT_MOUSEMOVE:
+		{
+			GetInterface()->SetCursorInfo( SCursorInfo() );
+			break;
+		}
+	case EVENT_TEMPLATELOAD:
+		{
+			pAllyTurn = new CAITurnProgressBar( sEvent.pLoader->GetControl( "allyturn" ), pMission, true );
+			pEnemyTurn = new CAITurnProgressBar( sEvent.pLoader->GetControl( "enemyturn" ), pMission, false );
+			break;
+		}
+	case EVENT_TEMPLATELOADCOMPLETE:
+		{
+			// NOTE: retail has no "minimap" control here (confirmed absent from both retail iTopPanel.c
+			// and the release gamedata); the old minimap fetch only emitted a UI-ERROR + dummy control.
+			pEndMission = GetUIWindow<CButton>( this, "endmission" );
+			pEndMission->AddImageState( EENDMISSTATE_OK, NDb::GetUITexture( 602 ) );
+			pEndMission->AddImageState( EENDMISSTATE_WARNING, NDb::GetUITexture( 601 ) );
+			pEndMission->AddImageState( EENDMISSTATE_UNAVAILABLE, NDb::GetUITexture( 600 ) );
+
+			pText = GetUIWindow<CText>( this, "text" );
+			pFlash = GetUIWindow<CWindow>( this, "flash" );
+			pPlayerTurn = GetUIWindow<CWindow>( this, "playerturn" );
+
+			// retail @0x24d670: the Objectives button is enabled only when the mission has a scenario
+			// zone (mission vtbl+0x144; null in the tutorial -> grayed); label = string 0x43af / 0x45ee.
+			pObjectives = GetUIWindow<CPushButton>( this, "objectives" );
+			bool bObjectivesActive = IsValid( pMission->GetScenarioZone() );
+			pObjectives->SetStyle( STYLE_ENABLED, bObjectivesActive );
+			pObjectives->SetText( GetDBString( bObjectivesActive ? 0x43af : 0x45ee ) );
+			break;
+		}
+	}
+
+	if ( CWindow::ProcessMessage( sEvent ) )
+		return true;
+
+	switch( sEvent.nEvent )
+	{
+	case EVENT_LBUTTONUP:
+	case EVENT_LBUTTONDOWN:
+	case EVENT_LBUTTONDBLCLK:
+	case EVENT_RBUTTONUP:
+	case EVENT_RBUTTONDOWN:
+	case EVENT_RBUTTONDBLCLK:
+		return true;
+	}
+
+	return false;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CTopBar::Draw( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	EMode ePrevMode = eMode;
+	if ( pMission->IsRealTime() )
+		eMode = REALTIME;
+	else if ( pMission->GetActivePlayer()->GetPlayer() == pMission->GetWorld()->GetCurrentPlayer() )
+		eMode = PLAYER_TURN;
+	else if ( pMission->GetWorld()->GetDiplomacyState( pMission->GetActivePlayer()->GetPlayer(), pMission->GetWorld()->GetCurrentPlayer() ) == NDb::DS_ENEMY )
+		eMode = ENEMY_TURN;
+	else
+		eMode = ALLY_TURN;	// retail @0x24d010: non-enemy AI side gets the separate "allyturn" bar
+
+	// retail @0x24d010: every 500ms refresh CanLeaveZone and push the reason into the exit-button
+	// tooltip's "state" variable (the "Status:" line).
+	if ( sTime - sUpdateTime > N_LEAVEZONE_UPDATE_PERIOD )
+	{
+		sUpdateTime = sTime;
+		wstring wsReason;
+		bCanLeaveZone = pMission->CanLeaveZone( &wsReason );
+		if ( IsValid( pEndMission->GetToolTip() ) )
+			pEndMission->GetToolTip()->SetVal( L"state", wsReason );
+	}
+
+	// button face only -- retail never toggles STYLE_ENABLED here: a blocked click still reaches the
+	// handler, which logs the CanLeaveZone reason (CMission::ProcessEvent @0x202f96).
+	if ( !bCanLeaveZone )
+		pEndMission->SetActiveState( EENDMISSTATE_UNAVAILABLE );
+	else if ( pMission->GetActivePlayer()->IsPlayerWinner() )
+		pEndMission->SetActiveState( EENDMISSTATE_OK );
+	else
+		pEndMission->SetActiveState( EENDMISSTATE_WARNING );
+
+	if ( eMode != ePrevMode )
+	{
+		sModeTime = sTime;
+
+		CPtr<NDb::CString> pString;
+		if ( pMission->GetWorld()->IsInterrupt() )
+			pString = NDb::GetString( 904 );
+		else if ( eMode == ENEMY_TURN )
+			pString = NDb::GetString( 905 );	// 'Enemy Turn'
+		else if ( eMode == ALLY_TURN )
+			pString = NDb::GetString( 19328 );	// retail @0x24d010 (disasm 0x64d274): the ally turn has its OWN v1.x string 'Allies Turn' -- the Jan03 code reused 905
+		else if ( eMode == PLAYER_TURN )
+			pString = NDb::GetString( 903 );	// 'Player's Turn'
+
+		if ( IsValid( pString ) )
+		{
+			pText->SetText( pString->szStr );
+			pText->SetStyle( STYLE_VISIBLE, true );
+		}
+		else
+			pText->SetStyle( STYLE_VISIBLE, false );
+	}
+
+	// retail @0x24d010: reset all turn indicators, then light the one matching the current mode.
+	pFlash->SetStyle( STYLE_VISIBLE, false );
+	pAllyTurn->SetStyle( STYLE_VISIBLE, false );
+	pEnemyTurn->SetStyle( STYLE_VISIBLE, false );
+	pPlayerTurn->SetStyle( STYLE_VISIBLE, false );
+
+	if ( pMission->GetWorld()->IsInterrupt() && ( ( sTime - sModeTime ) < N_FLASH_TIME ) )
+		pFlash->SetStyle( STYLE_VISIBLE, true );
+	else if ( ( eMode == REALTIME ) || ( eMode == PLAYER_TURN ) )
+		pPlayerTurn->SetStyle( STYLE_VISIBLE, true );
+	else if ( eMode == ALLY_TURN )
+		pAllyTurn->SetStyle( STYLE_VISIBLE, true );
+	else if ( eMode == ENEMY_TURN )
+		pEnemyTurn->SetStyle( STYLE_VISIBLE, true );
+
+	CWindow::Draw( sTime, pView );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+} // namespace
+////////////////////////////////////////////////////////////////////////////////////////////////////
+using namespace NUI;
+REGISTER_SAVELOAD_CLASS( 0xB0521163, CAITurnProgressBar );
+REGISTER_SAVELOAD_CLASS( 0xB0521164, CTopBar );

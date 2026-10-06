@@ -1,0 +1,80 @@
+# Silent Storm
+
+*Русский | [English](README.en.md)*
+
+Исходники Silent Storm принадлежат Nival, оригинальный репозиторий: 
+https://github.com/nival/Silent-Storm
+
+В этом репозитории ведется доработка исходников с конечной целью -
+получение behaviour-equivalent версии Silent Storm v1.2, путём анализа
+.pdb файлов версии v1.1 (RussianPatch1) и декомпиляции v1.2.
+
+Текущий статус: игра собирается и запускается на файлах Steam версии,
+в целом играбельна, присутствуют различной заметности баги и расхождения с
+релизной версией.
+
+<div align="center">
+  <table>
+    <tr>
+      <td colspan="3" align="center">
+        <img width="300" alt="Screenshot 2026-07-17 143626" src="https://github.com/user-attachments/assets/a7fa15d4-6be7-491d-abf9-882c63bd00cd" />
+      </td>
+    </tr>
+    <tr>
+      <td colspan="3" align="center">
+        <img width="300" alt="Screenshot 2026-07-18 143925" src="https://github.com/user-attachments/assets/b7021f4c-839f-48cc-a508-4541a851f195" />
+        <img width="300" alt="Screenshot 2026-07-18 144009" src="https://github.com/user-attachments/assets/731740e4-74d0-41db-940a-5c687bb2fbd5" />
+      </td>
+    </tr>
+  </table>
+</div>
+
+---
+
+## Изменения относительно оригинальной игры
+Здесь перечислены самые заметные отличия этого кода от оригинала:
+
+- Поддержка всех разрешений, как в Sentinels (без обрезанных букв)
+- Поддержка Ctrl+V из системного буфера обмена в консоль
+- Исправлен баг с высоким уровнем сглаживания на высоких разрешениях экрана
+
+## Сборка
+
+### Требования
+- **Windows** с **Visual Studio 2022** (нужен компонент "Разработка классических
+  приложений на C++", MSVC v143, Windows SDK 10) или новее. Проверено на VS 2026.
+- **CMake 3.21+**
+- Сборка **только Win32 / x86**.
+- *Необязательно:* **DirectX SDK June 2010** (https://www.microsoft.com/en-us/download/details.aspx?id=6812) - нужен
+  только для сборки инструмента `ShaderCompiler`; если его нет, инструмент
+  пропускается автоматически.
+
+### Сборка
+Запустите **`build.bat`** или выполните в терминале из папки репозитория:
+
+```
+cmake -S . -B build -A Win32
+cmake --build build --config Release
+```
+
+Результаты появятся в **`build\Release\`** - `Game.exe` и инструменты (`DataImport`,
+`PkgBuilder`, `FontGen`, `TexConv`, `TexMipStrip`, `ShaderCompiler`, `LSConverter`).
+
+Для отладки запустите **`build-debug.bat`** (собирает конфигурацию `RelWithDebInfo`),
+откройте **`build\A5.sln`** в Visual Studio и запустите отладку проекта `Game`.
+CMake попытается подсунуть вашу папку с игрой в рабочий каталог отладчика, если
+у него это не получится, то нужно указать её вручную. Правой кнопкой по проекту
+`Game` - Свойства - Отладчик - Рабочий каталог. Пример 
+`E:/SteamLibrary/steamapps/common/Silent Storm`
+
+### Запуск игры
+Поместите Game.exe (можно переименовать, чтобы не заменить оригинал) в папку с игрой
+(пример: `E:/SteamLibrary/steamapps/common/Silent Storm`). 
+Запустите Game.exe.
+
+### Примечания
+- импортируемые проприетарные библиотеки fmod / Bink / LifeStudio **генерируются во время сборки** из
+  зафиксированных таблиц экспорта `.def` в каталоге `third_party/` - оригинальные SDK не требуются.
+- `MapEdit`, `Scintilla`, `OpenDynamix` оставлены в репозитории, но **не
+  собираются** (по тем или иным причинам, с MapEdit там вообще всё сложно); их списки 
+  исходников сохранены в `sources.cmake`.

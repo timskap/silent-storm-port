@@ -1,0 +1,629 @@
+#include "StdAfx.h"
+#include "Transform.h"
+#include "GView.h"
+#include "G2DView.h"
+#include "GSceneUtils.h"
+#include "wInterface.h"
+#include "wMainTrace.h"
+#include "wUICommands.h"
+#include "Sound.h"
+#include "RWGame.h"
+#include "RPGGame.h"
+#include "RPGGlobal.h"
+#include "scScenarioTracker.h"
+#include "scFlowChartItems.h"
+#include "Interface.h"
+#include "iMain.h"
+#include "iMission.h"
+#include "iMissionExec.h"
+#include "iShowHint.h"
+#include "iShowClue.h"
+#include "iIntroScreen.h"
+#include "iCommonUI.h"
+#include "iDesktopWindow.h"
+#include "..\MiscDll\Commands.h"
+#include "..\MiscDll\LogStream.h"
+#include "..\DBFormat\DataFormat.h"
+#include "..\DBFormat\DataLight.h"
+#include "..\DBFormat\DataMap.h"
+#include "..\FileIO\BasicChunk1.h"   // START_REGISTER / FINISH_REGISTER (the ui_followcamera cvar)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NGame::CMissionBase -- the retail mission base class bodies (release iBase.obj; serialization-
+// convergence W4.2 structural split; see iMission.h for the class banner and the tag table).
+//
+// Everything here only touches CMissionBase's own members. The retail mission pump (Step @0x1a3ad0 /
+// InternalStep @0x1a29f0 / ProcessEvent @0x1a2010 / ExecWorldCommand @0x1a30c0) and the exit/save/
+// load bind dispatch stay on the dev CMission monolith -- deferred behaviour leg.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NGame
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Shared retail CMissionBase BeginZone dispatch. Chapter scripts use this too
+// (the final chapters contain only BeginZone("ffight")).
+bool CMissionBase::ExecWorldBeginZoneCommand( NWorld::CUICmd *pCmd )
+{
+	CDynamicCast<NWorld::CUICmdBeginZone> pBeginZone( pCmd );
+	if ( !pBeginZone )
+		return false;
+	if ( !pGlobalGame->pScenarioTracker->IsScenarioAvailable() )
+		csSystem << "ERROR: Scenario not available!" << endl;
+	else
+	{
+		NScenario::CScenarioZone *pZone = pGlobalGame->pScenarioTracker->GetZoneByName( pBeginZone->szZone );
+		if ( IsValid( pZone ) )
+			NMainLoop::Command( new CICBeginMission( pZone, -1, vector<string>(), pGlobalGame, true ) );
+		else
+			csSystem << "ERROR: Zone not found " << pBeginZone->szZone << " !" << endl;
+	}
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Shared sound branch of retail ExecWorldCommand (v1.2 0x5a4510..0x5a4619).
+// Menus run world scripts too. The scene owns channels, not the queued command.
+bool CMissionBase::ExecWorldSoundCommand( NWorld::CUICmd *pCmd )
+{
+	CDynamicCast<NWorld::CUICmdPlaySound> pSound( pCmd );
+	if ( !pSound )
+		return false;
+	if ( IsValid( pSound->pChannel ) )
+	{
+		for ( list<CObj<CObjectBase> >::iterator i = soundsList.begin(); i != soundsList.end(); ++i )
+			if ( *i == pSound->pChannel )
+			{
+				soundsList.erase( i );
+				break;
+			}
+	}
+	else if ( IsValid( pSound->pSound ) )
+	{
+		if ( pSound->b3DSound )
+			// CSound has a single CObjectBase base at offset zero; its definition is private to Sound.cpp.
+			pSound->pChannel = reinterpret_cast<CObjectBase *>( GetSoundScene()->Add3DSound(
+				pSound->pSound, new NGScene::CCVec3( pSound->vPos ), 0 ) );
+		else
+			pSound->pChannel = GetSoundScene()->Add2DSound( pSound->pSound );
+		soundsList.push_back( pSound->pChannel.GetPtr() );
+	}
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Retail v1.2 0x5a3c80: shared by tactical, strategic and front-end worlds.
+bool CMissionBase::ExecWorldCommonCommand( NWorld::CUICmd *pCmd )
+{
+	if ( CDynamicCast<NWorld::CUICmdCameraLocator> pLoc = pCmd )
+	{
+		if ( IsValid( pExecLocator ) && !MustReplaceCameraExecutor( pExecLocator->GetPriority(), pLoc->GetPriority() ) )
+			return true;
+		if ( IsValid( pExecLocator ) )
+			pExecLocator->Cancel();
+		pExecLocator = CreateCameraExecutor( pLoc, this );
+	}
+	else if ( CDynamicCast<NWorld::CUICmdShowHint> pHint = pCmd )
+	{
+		if ( NGlobal::GetVar( "ui_showhints" ).GetFloat() == 1.0f || bTutorialMode )
+			NMainLoop::Command( new CICShowHint( this, pHint->GetID(), pHint->pHint, pGlobalGame ) );
+		else
+			DoEvent( new NWorld::CCmdInterfaceEvent( pHint->GetID() ) );
+	}
+	else if ( CDynamicCast<NWorld::CUICmdTutorialMode> pTutorial = pCmd )
+		bTutorialMode = pTutorial->bTutorial;
+	else if ( CDynamicCast<NWorld::CUICmdShowClue> pClue = pCmd )
+	{
+		if ( IsValid( pClue->pClue ) )
+			NMainLoop::Command( new CICShowClue( this, pClue->GetID(), pGlobalGame, GetActivePlayer()->GetGlobalPlayer(), pClue->pClue ) );
+	}
+	else if ( CDynamicCast<NWorld::CUICmdLockCamera> pLock = pCmd )
+	{
+		GetCamera()->FreezeCamera( pLock->bLock );
+		if ( bTutorialMode )
+			pActivePlayer->GetCamera()->FreezeCamera( pLock->bLock );
+	}
+	else if ( CDynamicCast<NWorld::CUICmdSetCameraClipDistance> pClip = pCmd )
+		GetCamera()->SetClipDistance( pClip->fMinDistance, pClip->fMaxDistance );
+	else if ( CDynamicCast<NWorld::CUICmdSetFloor> pFloor = pCmd )
+		SetCutFloor( pFloor->nFloor );
+	else if ( CDynamicCast<NWorld::CUICmdAIUnitWillMove> pMove = pCmd )
+	{
+		if ( IsValid( pMove->pUnit ) && IsValid( pActivePlayer ) && IsValid( pWorld ) )
+		{
+			NDb::EDiplomacyState state = pWorld->GetDiplomacyState( pActivePlayer->GetPlayer(), pMove->pUnit->GetPlayer() );
+			if ( state == NDb::DS_ENEMY )
+				pRender->FlashUnit( pMove->pUnit, CVec4( 78.0f / 255, 20.0f / 255, 0, 0 ) );
+			else if ( state == NDb::DS_NEUTRAL || state == NDb::DS_ALLY )
+				pRender->FlashUnit( pMove->pUnit, CVec4( 0, 77.0f / 255, 78.0f / 255, 0 ) );
+		}
+	}
+	else if ( CDynamicCast<NWorld::CUICmdSetAmbient> pAmbient = pCmd )
+	{
+		NDb::CAmbientLightReal *pDefault = pWorld->GetDefaultLight();
+		if ( pAmbient->bImmediate && pDefault )
+			GetScene()->SetAmbient( pDefault );
+		else if ( !pAmbient->pLight )
+			SetLightMode( nLightMode );
+		else
+		{
+			static SRand rnd;
+			CPtr<NDb::CAmbientLightReal> pLight = pAmbient->pLight->GetLight( &rnd, pWorld->GetCreateFlags() );
+			if ( IsValid( pLight ) )
+				GetScene()->SetAmbient( pLight );
+		}
+	}
+	else if ( CDynamicCast<NWorld::CUICmdSetAmbientEffect> pAmbient = pCmd )
+	{
+		static SRand rnd;
+		NDb::CEffect *pEffect = IsValid( pAmbient->pEffect ) ? pAmbient->pEffect->GetEffect( &rnd, pWorld->GetCreateFlags() ) : 0;
+		GetScene()->SetAmbientEffect( pEffect, pRender->GetTime()->GetValue(), pRender->GetTime() );
+	}
+	else if ( CDynamicCast<NWorld::CUICmdPlayEffect> pEffect = pCmd )
+	{
+		static SRand rnd;
+		if ( IsValid( pEffect->pEffect ) )
+		{
+			SFBTransform place;
+			MakeMatrix( &place, CVec3( 1, 1, 1 ), pEffect->vPos, 0 );
+			pEffect->pHandle = GetScene()->CreateParticles( pEffect->pEffect->GetEffect( &rnd, pWorld->GetCreateFlags() ),
+				pRender->GetTime()->GetValue(), pRender->GetTime(), place );
+		}
+	}
+	else if ( ExecWorldBeginZoneCommand( pCmd ) || ExecWorldSoundCommand( pCmd ) )
+	{
+	}
+	else if ( CDynamicCast<NWorld::CUICmdPlayVideo> pVideo = pCmd )
+		PlayVideoSequence( this, pVideo->GetID(), pVideo->szFileName, false );
+	else
+		return false;
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CMissionBase::UpdateWorldCameraCommand( const STime &sTime )
+{
+	if ( IsValid( pExecLocator ) && pExecLocator->Update( sTime ) )
+	{
+		pExecLocator->Finished();
+		pExecLocator = 0;
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail NGame::iBaseInit::iBaseInit @0x1a4610 (iBase.obj): registers the "ui_followcamera" cvar
+// (default 1) backing bCameraShowEnemyActions -- the "camera follows enemy actions" game option.
+// CMissionBase::GetFollowCameraState @0x1a1790 returns it; it gates the GetCamera selector's
+// enemy-turn-follow and camera-locator legs (@0x1a1ee0). Retail binds the bool directly through
+// RegisterVar; the dev RegisterVar is handler-based (same pattern as cheat_showall).
+static bool bCameraShowEnemyActions = true;
+static void VarFollowCamera( const string &szID, const NGlobal::CValue &sValue, void *pContext )
+{
+	bCameraShowEnemyActions = sValue.GetFloat() != 0;
+}
+START_REGISTER(iMissionBase)
+	REGISTER_VAR( "ui_followcamera", VarFollowCamera, 1, true )   // retail iBaseInit @0x1a4610: bSave=true (line in config.cfg)
+FINISH_REGISTER
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::CMissionBase @0x1a2c70 (default ctor member defaults; the retail exit/save/
+// load binds constructed there stay on the dev CMission). The time counters are wired exactly like
+// retail: pTimeFunc/pUITimeFunc adopt the counters' CCTime nodes.
+CMissionBase::CMissionBase():
+	bPause( false ), bRenderWorld( true ), nDeltaTime( 0 ),
+	bHideInterface( false ), bSpecialHideInterface( false ),
+	bWaitForPartFinished( false ), nLightMode( 0 ), bCheatVisibility( false ), bTutorialMode( false ),
+	bCanSave( true ), bCanRestart( false ),
+	sLastUpdateTime( 0 ), sMinFrameTime( 0 ), sFPSLimitLastTime( 0 )
+{
+	pTimeFunc = sTimeCounter.GetTime();
+	pUITimeFunc = sUITimeCounter.GetTime();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::Command @0x1a18f0: forward to the active player's commander
+void CMissionBase::Command( NWorld::CCommand *pCmd )
+{
+	ASSERT( pCmd );
+	pActivePlayer->GetCommander()->Do( pCmd );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::DoEvent @0x1a2fa0 (mission vtbl+0x2c): forward to the active player's
+// commander EVENTS channel -- never forces an interrupt, drained unconditionally each CWorld::Segment
+void CMissionBase::DoEvent( NWorld::CCommand *pCmd )
+{
+	ASSERT( pCmd );
+	pActivePlayer->GetCommander()->DoEvent( pCmd );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::OnGetFocus @0x1a19c0: back on top of the interface stack -- re-baseline the
+// render/mixer timers over the covered gap and resume every frozen channel
+void CMissionBase::OnGetFocus()
+{
+	pRender->ResetTiming();	// retail @0x2cb190 forwards to both sound mixers
+	pSoundScene->Pause( false );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::OnLostFocus @0x1a19e0: a menu covered the mission -- freeze every live channel
+// (this is why retail goes silent in the pause MENU but not on the Pause/Break realtime pause)
+void CMissionBase::OnLostFocus()
+{
+	pSoundScene->Pause( true );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::Command @0x1a15b0: wrap in CCmdSetCommand (+ CCmdContinue when instant),
+// dispatched through the virtual single-command slot
+void CMissionBase::Command( NWorld::CUnit *pUnit, NWorld::CCmd *pCmd, bool bInstantly )
+{
+	ASSERT( pUnit );
+	ASSERT( pCmd );
+	Command( new NWorld::CCmdSetCommand( pUnit, pCmd ) );
+
+	if ( bInstantly )
+		Command( new NWorld::CCmdSetCommand( pUnit, new NWorld::CCmdContinue ) );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::StopAction @0x1a29d0
+void CMissionBase::StopAction()
+{
+	pActivePlayer->GetCommander()->StopAction();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CMissionBase::IsReady() const
+{
+	// Retail v1.2 0x5a2a20: client sequence, AI player, turn/action, then top desktop.
+	if ( IsSequence() || pActivePlayer->IsAIPlayer() )
+		return false;
+
+	if ( !IsRealTime() && ( IsActionExecuted() || ( pWorld->GetCurrentPlayer() != pActivePlayer->GetPlayer() ) ) )
+		return false;
+
+	NUI::CDesktopWindow *pDesktop = GetDesktop();
+	return !IsValid( pDesktop ) || pDesktop->IsReady();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::IsActionExecuted @0x1a3e30
+bool CMissionBase::IsActionExecuted() const
+{
+	return pWorld->IsExecuting() || pActivePlayer->GetCommander()->HasCommands();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::IsRealTime @0x1a1900
+bool CMissionBase::IsRealTime() const
+{
+	return pWorld->GetCurrentPlayer() == 0;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::PauseGame @0x1a16a0 / IsGamePaused @0x1a16b0
+void CMissionBase::PauseGame( bool bState )
+{
+	bPause = bState;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CMissionBase::IsGamePaused() const
+{
+	return bPause;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::GetActivePlayer @0x1a1950
+IPlayerTracker* CMissionBase::GetActivePlayer() const
+{
+	ASSERT( pActivePlayer );
+	return pActivePlayer;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::SetActivePlayer @0x1a2480
+void CMissionBase::SetActivePlayer( IPlayerTracker* pPlayer )
+{
+	ASSERT( find( playersSet.begin(), playersSet.end(), pPlayer ) != playersSet.end() );
+	pActivePlayer = pPlayer;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::GetPlayers @0x1a3f90
+void CMissionBase::GetPlayers( vector< CPtr<IPlayerTracker> > *pPlayersSet ) const
+{
+	ASSERT( pPlayersSet );
+	pPlayersSet->clear();
+	pPlayersSet->resize( playersSet.size() );
+	for ( int nTemp = 0; nTemp < playersSet.size(); nTemp++ )
+		(*pPlayersSet)[nTemp] = playersSet[nTemp].GetPtr();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::GetUnits @0x1a1960 / GetSelectedUnits @0x1a1970 / CountSelected @0x1a1980 /
+// Select @0x1a1990 / SelectNext @0x1a19a0 / SelectPrev @0x1a19b0 -- forwards to the active tracker
+void CMissionBase::GetUnits( vector< CPtr<IUnitTracker> > *pUnits ) const
+{
+	pActivePlayer->GetUnits( pUnits );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CMissionBase::GetSelectedUnits( vector< CPtr<IUnitTracker> > *pUnits ) const
+{
+	pActivePlayer->GetSelectedUnits( pUnits );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int CMissionBase::CountSelected()
+{
+	return pActivePlayer->CountSelected();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CMissionBase::Select( NWorld::CUnit *pUnit, bool bAdditive )
+{
+	pActivePlayer->Select( pUnit, bAdditive );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CMissionBase::SelectNext()
+{
+	pActivePlayer->SelectNext();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CMissionBase::SelectPrev()
+{
+	pActivePlayer->SelectPrev();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::IsPlayerTurn @0x1a1910: false only in turn-based play while the world's
+// current player (world vtbl+0x60 GetCurrentPlayer) is not the active tracker's player.
+bool CMissionBase::IsPlayerTurn() const
+{
+	if ( !IsRealTime() && pWorld->GetCurrentPlayer() != pActivePlayer->GetPlayer() )
+		return false;
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::GetFollowCameraState @0x1a1790: the ui_followcamera option flag.
+bool CMissionBase::GetFollowCameraState() const
+{
+	return bCameraShowEnemyActions;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::GetCamera @0x1a1ee0 -- the camera SELECTOR. The mission owns TWO kinds of
+// camera: its own pCamera (base tag 18) is the CINEMATIC camera (sequences, enemy-turn follow,
+// camera-locator focus -- the camera the scripts lock/steer, routinely saved with nLockCount >= 1),
+// and each player tracker owns the camera the PLAYER drives (tracker tag 10). Selection:
+//  - a scripted sequence -> the cinematic camera, unconditionally;
+//  - enemy turn with ui_followcamera on -> the cinematic camera;
+//  - a live camera-locator exec with ui_followcamera on, outside the HQ base (world vtbl+0x1dc =
+//    CWorld::IsBase @0x376e20) -> the cinematic camera;
+//  - else -> the ACTIVE PLAYER's camera; the cinematic camera's unlock-intent latches are cleared
+//    by a net-zero FreezeCamera(true)/(false) pair (@0xcffc0 clears them on the freeze).
+// Tail: if the chosen camera reports UserWantedItToUnlock (@0xd0020 -- the user gave camera input
+// while it was locked/following), hand control back to the player's camera, carrying the current
+// pose over on the one-shot bJustWanted so the view does not jump.
+ICamera* CMissionBase::GetCamera() const
+{
+	if ( IsSequence() )
+		return pCamera;
+
+	ICamera *pCam;
+	if ( GetFollowCameraState() && !IsPlayerTurn() )
+		pCam = pCamera;
+	else if ( GetFollowCameraState() && IsValid( pExecLocator ) && !GetWorld()->IsBase() )
+		pCam = pCamera;
+	else
+	{
+		pCamera->FreezeCamera( true );
+		pCamera->FreezeCamera( false );
+		pCam = pActivePlayer->GetCamera();
+	}
+
+	bool bJustWanted = false;
+	if ( pCam->UserWantedItToUnlock( &bJustWanted ) )
+	{
+		if ( bJustWanted && pCam != pActivePlayer->GetCamera() )
+		{
+			ICamera::SCameraPos sPos;
+			pCam->GetPlacement( &sPos );
+			pActivePlayer->GetCamera()->SetPlacement( sPos );
+		}
+		pCam = pActivePlayer->GetCamera();
+	}
+	return pCam;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::FocusCameraOnUnit @0x1a16e0: anchor the camera on the unit + cut the scene
+// to the unit's floor. Retail focuses the LIVE camera (@0x5a16e8 GetCamera, mission vtbl+0xb8), not
+// pCamera -- which is usually NOT the rendered one, so focusing it moved nothing.
+void CMissionBase::FocusCameraOnUnit( NWorld::CUnit *pUnit )
+{
+	ICamera *pCam = GetCamera();
+	CVec3 pt = pUnit->GetPosition().pos.GetCP();
+	pt.z += 0.5f;
+	pCam->FocusOnPlace( pt, pUnit->GetPosition().pos.GetFloor() );
+	GetScene()->SetCutFloor( pCam->GetCutFloor() );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::FocusCameraOnItem @0x1a1740 (mission vtbl+0xc4): anchor the camera on the
+// item's position and cut the scene to the item's floor -- the same camera anchor+floor call as
+// FocusCameraOnUnit @0x1a16e0, minus that path's +0.5z lift (items anchor on their pos).
+// Fired by the in-world hint/clue icons' RBUTTONUP (retail SEvent 0x6000034).
+void CMissionBase::FocusCameraOnItem( NWorld::IItem *pItem )
+{
+	ICamera *pCam = GetCamera();							// @0x5a1740: the LIVE camera, as above
+	pCam->FocusOnPlace( pItem->GetPos(), pItem->GetFloor() );
+	GetScene()->SetCutFloor( pCam->GetCutFloor() );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+NUI::ICursor* CMissionBase::GetCursor() const
+{
+	return pCursor;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+NUI::CInterface* CMissionBase::GetInterface() const
+{
+	return pInterface;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::IsInterfaceHidden @0x19de80
+bool CMissionBase::IsInterfaceHidden() const
+{
+	return bHideInterface;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::SetWaitForPartFinished @0x19de90 / IsWaitForPartFinished @0x19dea0
+void CMissionBase::SetWaitForPartFinished( bool bState )
+{
+	bWaitForPartFinished = bState;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CMissionBase::IsWaitForPartFinished() const
+{
+	return bWaitForPartFinished;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::PopDesktop @0x1a2fc0: pop from the back until the requested desktop popped
+void CMissionBase::PopDesktop( NUI::CDesktopWindow *pDesktop )
+{
+	for ( int nTemp = 0; nTemp < desktopWindowsList.size(); nTemp++ )
+	{
+		NUI::CDesktopWindow *pTempWnd = desktopWindowsList.back();
+		desktopWindowsList.pop_back();
+
+		if ( pTempWnd == pDesktop )
+			break;
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::PushDesktop @0x1a3030
+void CMissionBase::PushDesktop( NUI::CDesktopWindow *pDesktop )
+{
+	desktopWindowsList.push_back( pDesktop );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::GetDesktop @0x1a2000 returns the list back UNCHECKED (the retail mission
+// desktop always sits at the bottom of the list); the dev adds the empty guard for the
+// CRenderBaseInterface-family, whose list stays empty.
+NUI::CDesktopWindow* CMissionBase::GetDesktop() const
+{
+	if ( !desktopWindowsList.empty() )
+		return desktopWindowsList.back();
+
+	return 0;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::SetCheatVisibility @0x19deb0 / GetCheatVisibility @0x19dec0
+void CMissionBase::SetCheatVisibility( bool bState )
+{
+	bCheatVisibility = bState;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CMissionBase::GetCheatVisibility() const
+{
+	return bCheatVisibility;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::GetRPGGame @0x19df10 / GetWorld / GetScene @0x103d20 / GetSoundScene
+// @0x19df20 / GetRenderGame @0x19df30
+NRPG::CGlobalGame* CMissionBase::GetRPGGame() const
+{
+	return pGlobalGame;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+NWorld::IWorld* CMissionBase::GetWorld() const
+{
+	return pWorld;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+NGScene::IGameView* CMissionBase::GetScene() const
+{
+	return pScene;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+NSound::ISoundScene* CMissionBase::GetSoundScene() const
+{
+	return pSoundScene;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+NRender::IRenderGame* CMissionBase::GetRenderGame() const
+{
+	return pRender;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail COMDAT-stub default (out-of-line: CTransformStack is forward-declared in iMission.h);
+// CMission overrides with its real per-frame transform.
+const CTransformStack& CMissionBase::GetCameraTransform() const
+{
+	static CTransformStack ts;
+	return ts;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::SetLightMode @0x1a2640 -- ONE body on the base (the dev previously carried
+// identical copies on CMission and CRenderBaseInterface; consolidated here)
+void CMissionBase::SetLightMode( int _nLightMode )
+{
+	CDBTable<NDb::CTAmbientLight> *pTable = NDatabase::GetTable<NDb::CTAmbientLight>();
+	CDBIterator<NDb::CTAmbientLight> it( *pTable );
+	int nCount = _nLightMode;
+	while ( it.MoveNext() )
+	{
+		SRand rnd;
+		CPtr<NDb::CAmbientLightReal> pLight = it.Get()->GetLight( &rnd );
+		if ( !pLight->bInGameUse )
+			continue;
+		if ( nCount == 0 )
+		{
+			nLightMode = _nLightMode;
+			pLightSource = 0;
+			csSystem << "Light with ID = " << it.Get()->GetRecordID() << " selected" << endl;
+			GetScene()->SetAmbient( pLight );
+			return;
+		}
+		nCount--;
+	}
+	if ( _nLightMode == 0 )
+	{
+		// no lighting in table, using default one
+		nLightMode = 0;
+		GetScene()->SetAmbient( 0 );
+		pLightSource = GetScene()->AddDirectionalLight( CVec3(0.5f,0.4f,0.45f), CVec3( 0.6f,1.4f,-1), CVec3(5,5,0), CVec2( 150, 150 ), 20 );
+		GetScene()->SetAmbient( CVec3( 0.20f, 0.20f, 0.20f ), CVec3( 0.20f, 0.20f, 0.20f ) );
+	}
+	else
+		SetLightMode( 0 );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CMissionBase::RenderFrame @0x1a19f0 (was the dev CMission::RenderFrame -- the body only
+// touches base members, so it lands here per the retail placement; CMission no longer overrides it).
+// Param 2 is the ADVANCE flag (retail PDB: (int,bool,ICamera*,bool)) -- the old dev `const STime&`
+// was a mis-decode. Interface rendering uses GetUITime(); sound now follows the Sentinels fix below.
+void CMissionBase::RenderFrame( int nMode, bool bAdvanceTime, ICamera *pCamera, bool bShowUnits )
+{
+	if ( nMode & N_RENDERMODE_3D )
+	{
+		CTransformStack ts;
+		pCamera->GetTransform( &ts, pScene->GetScreenRect() );
+
+		// ORIGINAL RETAIL BUG FIXED: v1.2 0x5a2613 passes raw GetTime(), which omits
+		// fast-forwarded enemy turns. Sentinels 0x497fb1 calls GetGameTime (0x49aca0)
+		// instead, keeping playback on the epoch used to stamp world sound events.
+		// The mixer must also consume the full delta (RWSound.cpp), not clamp it once.
+		pRender->UpdateSound( bAdvanceTime, &ts, GetGameTime() );
+
+		const CTRect<float> &rScreen = pCamera->GetScreenRect();
+		if ( ( rScreen.Width() != 0 ) && ( rScreen.Height() != 0 ) )
+		{
+			NGScene::IGameView::SDrawInfo drawInfo;
+			drawInfo.pTS = &ts;
+			drawInfo.vOrigin = CVec2( rScreen.x1, rScreen.y1 );
+			drawInfo.vSize = CVec2( rScreen.x2 - rScreen.x1, rScreen.y2 - rScreen.y1 );
+			drawInfo.bUseDefaultClearColor = true;
+			drawInfo.vClearColor = CVec3(0.25f,0.25f,0.25f); // not used due to using default clear color
+			pScene->Draw( drawInfo );
+		}
+	}
+
+	if ( !bHideInterface && !bSpecialHideInterface && ( nMode & N_RENDERMODE_2D ) )
+		pInterface->Draw( GetUITime() );	// retail @0x1a19f0: the always-running UI counter, not the raw clock
+
+	float fFrameTime = NGScene::GetFrameTime();
+	static float fMinFrameTime = 1, fMaxFrameTime = 1e-4f, fElapsed = 0;
+	static int nFrames;
+	fMinFrameTime = Min( fMinFrameTime, fFrameTime );
+	fMaxFrameTime = Max( fMaxFrameTime, fFrameTime );
+	fElapsed += fFrameTime;
+	++nFrames;
+	if ( fElapsed > 3 )
+	{
+		DebugTrace( "min %f max %f average %f\n", 1 / fMaxFrameTime, 1 / fMinFrameTime, nFrames / fElapsed );
+		fMinFrameTime = 1;
+		fMaxFrameTime = 1e-4f;
+		fElapsed = 0;
+		nFrames = 0;
+	}
+
+	if ( !( nMode & 8 ) )	// retail @0x5a1c29: bit 8 (CAutoPlayInterface logo frame) suppresses the present
+		NGScene::Flip();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+} // NAMESPACE
+////////////////////////////////////////////////////////////////////////////////////////////////////

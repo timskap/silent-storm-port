@@ -1,0 +1,327 @@
+#include "StdAfx.h"
+#include "Transform.h"
+#include "GView.h"
+#include "G2DView.h"
+#include "GSceneUtils.h"
+#include "wInterface.h"
+#include "Sound.h"
+#include "RWGame.h"
+#include "RWSound.h"
+#include "RPGGame.h"
+#include "RPGGlobal.h"
+#include "Interface.h"
+#include "iMain.h"
+#include "iMainMenu.h"
+#include "iAutoPlay.h"
+#include "iFlashImage.h"
+#include "iMission.h"          // NGame::CICBeginMission (the tutorial jumps straight into a mission)
+#include "iRenderWorld.h"
+#include "iSaveLoad.h"
+#include "iCommonUI.h"
+#include "iSideMenu.h"
+#include "iCustomGameMenu.h"   // NGame::CICCustomGameMenu (the custom-game / mods-browser screen)
+#include "iOptionsMenu.h"
+#include "iCreditsScreen.h"
+#include "..\Misc\StrProc.h"
+#include "..\MiscDll\Commands.h"
+#include "..\Input\Bind.h"
+#include "..\DBFormat\DataMap.h"
+#include "..\DBFormat\DataRPG.h"
+#include "..\DBFormat\DataSound.h"
+#include "..\DBFormat\DataFormat.h"
+#include "..\DBFormat\DataCamera.h"
+////////////////////////////////////////////////////////////////////////////////////////////////////
+const int
+	N_MAINMENU_CAMERA = 26,
+	N_MAINMENU_TEMPLATE = 2425,
+	N_LOGO_FLASHTIME = 2000,
+	N_TUTORIAL_HERO = 730,			// release @0x1f7540: the tutorial global player's single pers id (0x2da)
+	N_TUTORIAL_MISSION = 3589;		// release @0x1f7540: the tutorial mission template (0xe05)
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NUI
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CFlashImage
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CFlashImage::CFlashImage( const SWindowInfo &sInfo ):
+	CWindow( sInfo ), fCoeff( 0 ), sMorphTime( 0 )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CFlashImage::ProcessMessage( const SEvent &sEvent )
+{
+	switch( sEvent.nEvent )
+	{
+		case EVENT_TEMPLATELOADCOMPLETE:
+		{
+			pActive = GetUIWindow<CImage>( this, "active" );
+			pBackground = GetUIWindow<CImage>( this, "background" );
+			break;
+		}
+	}
+
+	return CWindow::ProcessMessage( sEvent );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CFlashImage::Draw( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	float fTargetCoeff = float( sTime % ( N_LOGO_FLASHTIME * 2 ) ) / N_LOGO_FLASHTIME;
+	if ( fTargetCoeff > 1 )
+		fTargetCoeff = 2 - fTargetCoeff;
+
+	fCoeff = CalcFlashCoeff( fCoeff, fTargetCoeff, sTime, sMorphTime );
+	sMorphTime = sTime;
+
+	pActive->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF * fCoeff ) );
+
+	CWindow::Draw( sTime, pView );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CMainMenuUI
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CMainMenuUI: public CWindow
+{
+	OBJECT_BASIC_METHODS(CMainMenuUI);
+private:
+	ZDATA_(CWindow)
+	CObj<CFlashImage> pLogo;
+	CObj<CButtonsLine> pButtonsLine1;
+	CObj<CButtonsLine> pButtonsLine2;
+	CObj<CHoverButton> pTutorial;
+	CObj<CHoverButton> pCampaign;
+	CObj<CHoverButton> pCustomGame;
+	CObj<CHoverButton> pLoadGame;
+	CObj<CHoverButton> pOptions;
+	CObj<CHoverButton> pCredits;
+	CObj<CHoverButton> pQuit;
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CWindow*)this); f.Add(2,&pLogo); f.Add(3,&pButtonsLine1); f.Add(4,&pButtonsLine2); f.Add(5,&pTutorial); f.Add(6,&pCampaign); f.Add(7,&pCustomGame); f.Add(8,&pLoadGame); f.Add(9,&pOptions); f.Add(10,&pCredits); f.Add(11,&pQuit); return 0; }
+public:
+	CMainMenuUI() {}
+	CMainMenuUI( const SWindowInfo &sInfo );
+
+	bool ProcessMessage( const SEvent &sEvent );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CMainMenuUI::CMainMenuUI( const SWindowInfo &sInfo ): 
+	CWindow( sInfo )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CMainMenuUI::ProcessMessage( const SEvent &sEvent )
+{
+	switch( sEvent.nEvent )
+	{
+		case EVENT_TEMPLATELOAD:
+		{
+			// The retail menu wraps the line_1/line_2 template controls in two CButtonsLine and fills
+			// them with hover-buttons programmatically (the per-button static controls the predecessor
+			// looked up by name do not exist in the retail container). Per button the three captions are
+			// GetDBString(markup) + GetDBString(name): the per-state markup string (a <font face=Impact
+			// size=36pt outline...> tag, ids NORMAL 0x2b79 / HOVER 0x2b7a / DISABLED 0x43bb) MUST precede
+			// the caption text so the font/colour applies (same order as the predecessor's prefix+text).
+			// The 2nd arg is the tooltip DB-string id. Ids from CMainMenuUI::ProcessMessage @0x1f79d0.
+			pLogo = new CFlashImage( sEvent.pLoader->GetControl( "logo" ) );
+
+			pButtonsLine1 = new CButtonsLine( sEvent.pLoader->GetControl( "line_1" ) );
+			pButtonsLine2 = new CButtonsLine( sEvent.pLoader->GetControl( "line_2" ) );
+
+			pTutorial   = pButtonsLine1->AddHoverButton( "tutorial",   0x4bed, GetDBString( 0x2b79 ) + GetDBString( 0x4559 ), GetDBString( 0x2b7a ) + GetDBString( 0x4559 ), GetDBString( 0x43bb ) + GetDBString( 0x4559 ) );
+			pCampaign   = pButtonsLine1->AddHoverButton( "campaign",   0x4be9, GetDBString( 0x2b79 ) + GetDBString( 0x2a96 ), GetDBString( 0x2b7a ) + GetDBString( 0x2a96 ), GetDBString( 0x43bb ) + GetDBString( 0x2a96 ) );
+			pCustomGame = pButtonsLine1->AddHoverButton( "customgame", 0x4dc0, GetDBString( 0x2b79 ) + GetDBString( 0x4dc1 ), GetDBString( 0x2b7a ) + GetDBString( 0x4dc1 ), GetDBString( 0x43bb ) + GetDBString( 0x4dc1 ) );
+			pLoadGame   = pButtonsLine1->AddHoverButton( "loadgame",   0x4bea, GetDBString( 0x2b79 ) + GetDBString( 0x2a97 ), GetDBString( 0x2b7a ) + GetDBString( 0x2a97 ), GetDBString( 0x43bb ) + GetDBString( 0x2a97 ) );
+
+			pOptions    = pButtonsLine2->AddHoverButton( "options",    0x4beb, GetDBString( 0x2b79 ) + GetDBString( 0x2a98 ), GetDBString( 0x2b7a ) + GetDBString( 0x2a98 ), GetDBString( 0x43bb ) + GetDBString( 0x2a98 ) );
+			pCredits    = pButtonsLine2->AddHoverButton( "credits",    0x4bee, GetDBString( 0x2b79 ) + GetDBString( 0x2a99 ), GetDBString( 0x2b7a ) + GetDBString( 0x2a99 ), GetDBString( 0x43bb ) + GetDBString( 0x2a99 ) );
+			pQuit       = pButtonsLine2->AddHoverButton( "quit",       0x4bec, GetDBString( 0x2b79 ) + GetDBString( 0x2a9a ), GetDBString( 0x2b7a ) + GetDBString( 0x2a9a ), GetDBString( 0x43bb ) + GetDBString( 0x2a9a ) );
+			break;
+		}
+		case EVENT_TEMPLATELOADCOMPLETE:
+		{
+			// Retail v1.2 0x5f8205..0x5f82ad: replace the template caption
+			// with the localized version, right-aligned styling and build date.
+			CPtr<CText> pVersion = GetUIWindow<CText>( this, "version" );
+			pVersion->SetText( NStr::Format(
+				L"<font size=14pt face=Courier><right><color=grey>%s %hs",
+				GetDBString( 0x4f17 ).c_str(), __DATE__ ), true );
+			break;
+		}
+	}
+
+	return CWindow::ProcessMessage( sEvent );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+} // NAMESPACE
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NGame
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CMainMenuInterface
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CMainMenuInterface: public CRenderBaseInterface
+{
+	OBJECT_BASIC_METHODS(CMainMenuInterface);
+private:
+	NInput::CBind bindTutorial, bindCampaign, bindCustomGame, bindLoadGame, bindOptions, bindCredits, bindQuitGame;
+
+	ZDATA_(CRenderBaseInterface)
+	STime sAutoPlayTime = 0;
+	CObj<NUI::CMainMenuUI> pMainMenuUI; // transient; the base interface owns the window tree
+public:
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CRenderBaseInterface*)this); f.Add(2,&sAutoPlayTime); return 0; }
+
+public:
+	CMainMenuInterface();
+
+	void Initialize();
+
+	void Step();
+	void OnGetFocus();
+	bool ProcessEvent( const NInput::SEvent &sEvent );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CMainMenuInterface
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CMainMenuInterface::CMainMenuInterface():
+	bindTutorial( "tutorial" ), bindCampaign( "campaign" ), bindCustomGame( "customgame" ), bindLoadGame( "loadgame" ), bindOptions( "options" ), bindCredits( "credits" ), bindQuitGame( "quit" )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CMainMenuInterface::Initialize()
+{
+	CRenderBaseInterface::Initialize( N_MAINMENU_TEMPLATE );
+
+	CPtr<NDb::CDBCamera> pDBCamera = NDb::GetDBCamera( N_MAINMENU_CAMERA );
+	ICamera::SCameraPos sCameraPos( pDBCamera->vAnchor, pDBCamera->fDistance, pDBCamera->fPitch, pDBCamera->fYaw, pDBCamera->fRoll, pDBCamera->fFOV );
+	GetCamera()->SetPlacement( sCameraPos );
+
+	pMainMenuUI = new NUI::CMainMenuUI( NUI::SWindowInfo( GetInterface(), NUI::SPoint( 0, 0 ), NUI::SPoint( 1024, 768 ), "mainmenuUI" ) );
+	NUI::LoadTemplate( pMainMenuUI, NDb::GetUIContainer( 347 ) );
+	pMainMenuUI->ShowWindow( NUI::SWTYPE_SHOW );
+
+	// The map variant's own script supplies the animation and ambient sound.
+	// RunPostInit starts it, just as for a mission; no additional UI script is needed.
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CMainMenuInterface::ProcessEvent( const NInput::SEvent &sEvent )
+{
+	NInput::SetSection( "menu" );
+	// Retail v1.2 0x5f7d50: reset BEFORE the UI can consume the input.
+	if ( sEvent.mMessage.cType != NInput::CT_TIME )
+		sAutoPlayTime = GetUITime();
+
+	if ( CRenderBaseInterface::ProcessEvent( sEvent ) )
+		return true;
+
+	if ( bindTutorial.ProcessEvent( sEvent ) )
+	{
+		// release CMainMenuInterface::ProcessEvent @0x1f7540, tutorial branch (checked FIRST): build a
+		// fresh one-hero global game -- CreateGlobalPlayer({pers 730}) + CreateGlobalGame(-1, <null
+		// difficulty>; dev CreateGlobalGame supplies the default) -- and jump straight into the tutorial
+		// mission template 3589, variant -1, time-of-day "Day" (no side menu, no chapter map).
+		vector<int> personages;
+		personages.push_back( N_TUTORIAL_HERO );
+
+		CPtr<NRPG::CGlobalGame> pGame = NRPG::CreateGlobalGame( -1 );
+		pGame->players.push_back( NRPG::CreateGlobalPlayer( personages ) );	// CObj<> stores an owning AddRef'd reference
+
+		vector<string> templParams;
+		templParams.push_back( "Day" );
+		NMainLoop::Command( new CICBeginMission( N_TUTORIAL_MISSION, -1, templParams, pGame ) );
+		return true;
+	}
+	else if ( bindCampaign.ProcessEvent( sEvent ) )
+	{
+		NMainLoop::Command( new CICSideMenu() );
+		return true;
+	}
+	else if ( bindCustomGame.ProcessEvent( sEvent ) )   // retail CMainMenuInterface::ProcessEvent @0x1f7540: new CICCustomGameMenu
+	{
+		NMainLoop::Command( new CICCustomGameMenu() );
+		return true;
+	}
+	else if ( bindLoadGame.ProcessEvent( sEvent ) )
+	{
+		// Retail v1.2 0x5f8064: main-menu loading never offers a Save tab.
+		NMainLoop::Command( new NGame::CICSaveLoadMenu( NGame::LOAD, 0, false ) );
+		return true;
+	}
+	else if ( bindOptions.ProcessEvent( sEvent ) )
+	{
+		NMainLoop::Command( new NGame::CICOptions( NGame::OS_PROFILE, 0, this ) );
+		return true;
+	}
+	else if ( bindCredits.ProcessEvent( sEvent ) )
+	{
+		NMainLoop::Command( new NGame::CICCreditsScreen( false ) );
+		return true;
+	}
+	else if ( bindQuitGame.ProcessEvent( sEvent ) )
+	{
+		NMainLoop::Command( 0 ); 
+		return true;
+	}
+
+	return false;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CMainMenuInterface::Step()
+{
+	// This front-end uses its own Step rather than the common mission pump.
+	sUITimeCounter.Advance( true, GetTime() );
+	CRenderBaseInterface::Step();
+
+	if ( CanRender() )
+	{
+		// Retail v1.2 GameStep 0x5f79a0: strictly more than two idle minutes.
+		if ( GetUITime() - sAutoPlayTime > 120000 )
+			NMainLoop::Command( new CICAutoPlay() );
+		// Render the 3D menu world full-screen. The predecessor derived a sub-rect from a "clientview" UI
+		// control, but the retail menu container (347) ships no such control (-> GetUIWindow fell back to a
+		// zero-size window -> zero camera screen-rect -> RenderFrame skipped pScene->Draw -> no 3D backdrop,
+		// and the "control clientview not found" log spam). The release sets a full-screen rect directly.
+		GetCamera()->SetScreenRect( CTRect<float>( 0.0f, 0.0f, 1.0f, 1.0f ) );
+
+		RenderFrame( GetTime(), GetCamera() );
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CICMainMenu
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CMainMenuInterface::OnGetFocus()
+{
+	// Returning from a submenu or the demo begins a fresh idle interval.
+	sUITimeCounter.ResetTiming();
+	sAutoPlayTime = GetUITime();
+	CRenderBaseInterface::OnGetFocus();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CICMainMenu::CICMainMenu()
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CICMainMenu::Exec()
+{
+	ResetStack();
+	CMainMenuInterface *pRes = new CMainMenuInterface;
+	pRes->Initialize();
+	SetInterface( pRes );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+using namespace NUI;
+REGISTER_SAVELOAD_CLASS( 0xB2540910, CMainMenuUI );
+REGISTER_SAVELOAD_CLASS( 0xB2540911, CFlashImage );
+using namespace NGame;
+REGISTER_SAVELOAD_CLASS( 0xB2540912, CMainMenuInterface );
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Start mainmenu
+////////////////////////////////////////////////////////////////////////////////////////////////////
+static void StartMainMenu( const string &szID, const vector<wstring> &szParams, void *pContext )
+{
+	NMainLoop::Command( new NGame::CICMainMenu() );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+START_REGISTER(iMainMenu)
+	REGISTER_CMD( "mainmenu", StartMainMenu )
+FINISH_REGISTER

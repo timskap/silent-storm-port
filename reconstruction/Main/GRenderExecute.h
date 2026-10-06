@@ -1,0 +1,28 @@
+#ifndef __GRenderExecute_H_
+#define __GRenderExecute_H_
+#if _MSC_VER > 1000
+#pragma once
+#endif // _MSC_VER > 1000
+class CTransformStack;
+namespace NGScene
+{
+enum EExecMode { EM_NORMAL, EM_DEPTH_SORT };
+struct SLightInfo
+{
+	bool bNeedSet;
+	// retail SLightInfo+1: lighting-options bit 2 (no CL) -- executor swaps the CL register for the
+	// default lightmap so interface scenes never sample the world's CL content (@0x14a2b0)
+	bool bIgnoreCL;
+	CVec3 vGlossColor, vShadowColor, vAmbientColor, vUpDifColor;
+	CVec4 vLightColor, vLightPos, vRadius;
+
+	SLightInfo(): bNeedSet(false), bIgnoreCL(false), vLightColor(VNULL4), vGlossColor(VNULL3), vLightPos(VNULL4), vRadius(1,1,1,1) {}
+};
+
+void Execute( IRender *pRender, NGfx::CRenderContext *pRC, const CTransformStack &ts, const CRenderCmdList &cl,
+	const CSceneFragments &scene, const SLightInfo &lightInfo, EExecMode mode = EM_NORMAL,
+	vector<CPartFlags> *pOccluded = 0 );
+////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+#endif

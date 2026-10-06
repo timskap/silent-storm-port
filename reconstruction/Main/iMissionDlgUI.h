@@ -1,0 +1,118 @@
+#ifndef __A5_MISSIONDLG_UI_H__
+#define __A5_MISSIONDLG_UI_H__
+#if _MSC_VER > 1000
+#pragma once
+#endif // _MSC_VER > 1000
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NDb
+{
+	class CSound;
+	class CSequence;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NUI
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CMissionUI;
+class CAnimUnitView;
+////////////////////////////////////////////////////////////////////////////////////////////////////
+struct SAckEvent
+{
+	int nPriority;
+	wstring wsText;
+	CPtr<NWorld::CUnit> pUnit;
+	CDBPtr<NDb::CSound> pSound;
+	CDBPtr<NDb::CSequence> pSequence;
+	// retail SAckEvent tail: the per-phrase facial-expression sequence (UpdatePhrases @0x206d60
+	// resolves it via GetSequenceByExpression from the ack's FaceExpression column; first page only)
+	CDBPtr<NDb::CSequence> pExpression;
+	// Retail v1.1 0x609730 / v1.2 0x609e80: serialize each parsed page's values
+	// and references, not the string/smart-pointer storage. Without operator&,
+	// vector serialization dumps raw heap pointers and loaded dialogue pages crash.
+	int operator&( CStructureSaver &f )
+	{
+		f.Add(2,&nPriority); f.Add(3,&wsText); f.Add(4,&pUnit);
+		f.Add(5,&pSound); f.Add(6,&pSequence); f.Add(7,&pExpression);
+		return 0;
+	}
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CMissionDlgUI
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CMissionDlgUI: public CDesktopWindow
+{
+	OBJECT_NOCOPY_METHODS(CMissionDlgUI);
+private:
+	NInput::CBind bindCancel, bindNext, bindPrev;
+	////
+
+	enum EStage
+	{
+		START,
+		FADEIN,
+		MOVEUNITVIEWIN,
+		SHOWDIALOG,
+		////
+		FINISH,
+		MOVEUNITVIEWOUT,
+		FADEOUT
+	};
+	ZDATA_(CDesktopWindow)
+	CPtr<NGame::IMission> pMission;
+	CPtr<CDesktopWindow> pTransition;
+	////
+	int nPanelsStateSave;
+	int nID = -1;	// DialogPlay wait id, retail nNotifyID (save tag 5)
+	////
+	STime sStageTime;
+	EStage eStage;
+	////
+	int nStage;
+	vector<SAckEvent> parsedPhrasesSet;
+	vector<CObj<NWorld::CUnit> > unitsSet;
+	vector<CPtr<NWorld::CAckEvent> > phrasesSet;
+	////
+	CPtr<CImage> pTopBackground;
+	CPtr<CImage> pBottomBackground;
+	////
+	string szDialogCode;
+	CObj<CText> pDialog;
+	CObj<CHoverButton> pBack;
+	CObj<CHoverButton> pNext;
+	CObj<CHoverButton> pExit;
+	vector<CObj<CAnimUnitView> > unitViewsSet;
+	CObj<NSound::ISound2D> pSound;
+	// retail CMissionDlgUI pSequenceHolder (s2_types.h:27225): the view whose head currently plays a
+	// lipsync sequence -- cleared before a NEW phrase's sequence starts and on skip/close, so a
+	// skipped voiceline stops lipsyncing (SetStage @0x2059c0). Continuation pages (null pSequence)
+	// deliberately do NOT clear it: the same speaker keeps talking across subtitle pages.
+	CPtr<CAnimUnitView> pSequenceHolder;
+	int nDialogHeight = 0;	// template height, independent of the current page's fitted box
+	// Retail v1.2 0x608ea0: notification ID precedes stage state; sound,
+	// sequence holder and original dialog height are tags 20, 21 and 22.
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CDesktopWindow*)this); f.Add(2,&pMission); f.Add(3,&pTransition); f.Add(4,&nPanelsStateSave); f.Add(5,&nID); f.Add(6,&sStageTime); f.Add(7,&eStage); f.Add(8,&nStage); f.Add(9,&parsedPhrasesSet); f.Add(10,&unitsSet); f.Add(11,&phrasesSet); f.Add(12,&pTopBackground); f.Add(13,&pBottomBackground); f.Add(14,&szDialogCode); f.Add(15,&pDialog); f.Add(16,&pBack); f.Add(17,&pNext); f.Add(18,&pExit); f.Add(19,&unitViewsSet); f.Add(20,&pSound); f.Add(21,&pSequenceHolder); f.Add(22,&nDialogHeight); return 0; }
+
+protected:
+	void SetStage( int nStage );
+	void UpdatePhrases( NGScene::I2DGameView *pView );
+	void StartDialog();
+	void EndDialog();
+
+public:
+	CMissionDlgUI();
+	CMissionDlgUI( const SWindowInfo &sInfo, NGame::IMission *pMission, CDesktopWindow *pTransition, const string &szDialogCode, const vector<CObj<NWorld::CUnit> > &unitsSet, const vector<CPtr<NWorld::CAckEvent> > &phrasesSet, int nID = -1 );
+
+	void ShowDesktop();
+	void HideDesktop();
+	void UpdateDesktop( const STime &sTime );
+
+	bool IsValidCommand( NWorld::CUICmd *pCmd );
+	NGame::CUICmdExec* CreateExecutor( NWorld::CUICmd *pCmd );
+
+	bool ProcessEvent( const NInput::SEvent &sEvent );
+	bool ProcessMessage( const SEvent &sEvent );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+} // Namespace
+////////////////////////////////////////////////////////////////////////////////////////////////////
+#endif

@@ -1,0 +1,154 @@
+#ifndef __SCENARIOTRACKER_H_
+#define __SCENARIOTRACKER_H_
+//
+#include "..\MiscDll\Commands.h"
+#include "../DBFormat/DataFormat.h"
+#include "../DBFormat/DataScenario.h"
+#include "../DBFormat/DataRPG.h"
+//
+struct SRandomSeed;
+namespace NRPG
+{
+	class CUnit;
+	class CGlobalPlayer;
+	class CGlobalGame;
+	class IInventoryItem;
+}
+namespace NWorld
+{
+	class CPlayer;
+	class CUnit;
+	class CUnitServer;
+}
+//
+namespace NGlobal
+{
+	class CCmd;
+}
+//
+namespace NScenario
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CScenarioClue;
+class CScenarioZone;
+class CScenarioObjective;
+class CScenarioFlowChart;
+class CScenarioTask;
+class CScenarioGoal;
+struct SGoalDescription;
+enum EScenarioTaskState;
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CScenarioTracker
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CScenarioTracker: public CObjectBase
+{
+	OBJECT_BASIC_METHODS( CScenarioTracker );
+	//
+	NGlobal::CCmd cmdScenario;
+	NGlobal::CCmd cmdZone;
+	//
+	ZDATA
+	bool bScenarioAvailable;
+	CObj<CScenarioFlowChart> pScenarioFlowChart;
+	list< CPtr<CScenarioZone> > availableZones; // available zones
+	list< CPtr<CScenarioObjective> > finishedObjectives; // completed objectives
+	list< CPtr<CScenarioZone> > blockedZones; // blocked zones
+	list< CPtr<CScenarioClue> > takenClues;
+	list< CPtr<CScenarioClue> > destroyedClues;
+	int nZonesOpenOrder;
+	int nCluesOpenOrder;
+	ZEND int operator&( CStructureSaver &f ) { f.Add(2,&bScenarioAvailable); f.Add(3,&pScenarioFlowChart); f.Add(4,&availableZones); f.Add(5,&finishedObjectives); f.Add(6,&blockedZones); f.Add(7,&takenClues); f.Add(8,&destroyedClues); f.Add(9,&nZonesOpenOrder); f.Add(10,&nCluesOpenOrder); return 0; }
+	//
+	// CanLeaveZone result cache (retail +0x60..+0x6c). TRANSIENT: retail operator& @0x3043d0 stops at tag 10.
+	bool bHasCalcedCanLeaveZone = false;
+	bool bPrevCanLeaveZone = false;
+	bool bPrevGameOver = false;
+	list< CPtr<CScenarioClue> > prevCluesInHands;
+	list< CPtr<CScenarioClue> > prevCluesToFind;
+	list< CPtr<CScenarioClue> > prevDestroyedClues;
+	void InvalidateLeaveZoneCache() { bHasCalcedCanLeaveZone = false; }
+	//
+	void PostCreateScenario();
+	bool IsObjectiveFinished( CScenarioObjective *pObjective ) const;
+	bool IsZoneContainsSomeClue( CScenarioZone *pZone ) const;
+	bool IsZoneAvailable( CScenarioZone *pZone ) const;
+	bool IsZoneBlocked( CScenarioZone *pZone ) const;
+	void ExpandFlowChart();
+	void ProcessCluesList( const list< CPtr<CScenarioClue> > &clues,
+		NDb::EScenarioObjectiveType type );
+	void JustFoundClue( CScenarioClue *pClue );
+	void JustOpenZone( CScenarioZone *pZone );
+	// retail @0x302a20: collect the scenario clues a pers carries (his own pers-clue when alive, both
+	// hand slots, the backpack, then the carried corpse's clues); bTake also removes the clue items.
+	void GetCluesFromPers( NRPG::CUnit *pPers, NRPG::CUnit *pCorpsePers, list< CPtr<CScenarioClue> > *pClues, bool bTake ) const;
+	// retail @0x302e40: clues currently in the squad's hands (per world unit: its pers + carried corpse).
+	void GetCluesInHand( const vector< CPtr<NWorld::CUnit> > &units, list< CPtr<CScenarioClue> > *pClues ) const;
+	//
+public:
+	CScenarioTracker();
+	//
+	void CreateScenario( int nScenarioID );
+	void CreateScenario( string szScenarioName );
+	bool IsScenarioAvailable() const { return bScenarioAvailable; }
+	void DrawScenario();
+	void PrintScenarioList();
+	int GetTemplateIDByVariantID( int nVariantID ) const;
+	CScenarioZone* GetZone( int nTemplateID ) const;
+	CScenarioZone* GetZoneByDBZone( NDb::CDBScenarioZone *pDBZone ) const;
+	CScenarioZone* GetZoneByName( string szName ) const;
+	CScenarioClue* GetClueByName( string szName ) const;
+	CScenarioClue* GetClueByPersID( int nPersID ) const;
+	CScenarioClue* GetClueByItemID( int nItemID ) const;
+	bool IsClueFound( CScenarioClue *pClue ) const;
+	bool IsClueDestroyed( CScenarioClue *pClue ) const;
+	bool IsClueInHand( const vector< CPtr<NWorld::CUnit> > &units, CScenarioClue *pClue ) const;
+	void GetCluesFromZone( NRPG::CGlobalGame *pGame, CScenarioZone *pZone, vector< CPtr<CScenarioClue> > *pClues );
+	EScenarioTaskState GetTaskState( const vector< CPtr<NWorld::CUnit> > &units, CScenarioTask *pTask ) const;
+	EScenarioTaskState GetGoalDescription( SGoalDescription *pDescription, const vector< CPtr<NWorld::CUnit> > &units, CScenarioGoal *pGoal ) const;
+	void GetGoalsFromZone( vector<SGoalDescription> *pGoals, const vector< CPtr<NWorld::CUnit> > &units, NRPG::CGlobalGame *pGame );
+	//
+	void GetPlacedClues( NScenario::CScenarioZone *pZone, 
+		int nTemplateID, list< CPtr<CScenarioClue> > *clues ) const;
+	void GetAvailableZones( list< CPtr<CScenarioZone> > *pZones ) const;
+	void GetAvailableClues( list< CPtr<CScenarioClue> > *pClues ) const;
+	CScenarioZone* GetRecommendedZone( NRPG::CGlobalPlayer *pPlayer ) const;
+	void OpenZone( CScenarioZone *pZone );
+	void BlockZone( CScenarioZone *pZone );
+	void RevealZone( CScenarioZone *pZone ); // analog of OpenZone for accidental discovery of a zone
+	void CheatOpenZone( CScenarioZone *pZone );
+	//
+	NDb::CString* GetClueDescriptionFromObjective( CScenarioClue *pClue ) const;
+	//
+	void OnObjectiveComplete( CScenarioObjective *pObjective );
+	void CheatTakeClue( CScenarioClue *pClue, bool bImmediately = false );
+	void CheatDestroyClue( CScenarioClue *pClue, bool bImmediately = false );
+	bool OnScenarioClueTaken( int nID, bool bUnit );
+	void OnScenarioClueDestroyed( int nID, bool bUnit );
+	void OnItemTaken( NWorld::CUnitServer *pUS, NRPG::IInventoryItem *pItem, NDb::ESlot slot, bool bTaken );
+	void OnUpdateVisible( NWorld::CPlayer *pPlayer, CScenarioZone *pZone );
+	void OnUnitDestroyed( NWorld::CUnit *pUnit );
+	void OnMakeUnconscious( NWorld::CUnit *pUnit );
+	void ProcessScenario( const vector< CPtr<NRPG::CUnit> > &units );
+	// retail @0x3030b0: may the squad leave pZone without making the scenario unwinnable? Writes the
+	// scenario-unwinnable flag (destroyed clues considered) into *pbGameOver.
+	bool CanLeaveZone( const vector< CPtr<NWorld::CUnit> > &units, CScenarioZone *pZone, bool *pbGameOver );
+	SRandomSeed GetRandomSeedForTemplate( int nTemplateID ) const;
+	CScenarioZone* GetZoneInWhichClueWasFound( CScenarioClue *pClue ) const;
+	void GetZonesWhichCanBeOpened( CScenarioClue *pClue, list< CPtr<CScenarioZone> > *pZones ) const;
+	int GetScenarioID() const;
+	int GetMaxDifficulty() const;
+	//
+	// script-goal/task API (lua Scenario{AddGoal,SetGoalComplete,SetTaskComplete}). Goals are stored
+	// per-zone in CScenarioZone::scriptGoals; the player-facing journal that displays them is a
+	// separate absent subsystem (documented in scriptScenario.cpp).
+	void AddScriptGoal( CScenarioZone *pZone, int nGoalID );
+	bool ScriptGoalSetComplete( CScenarioZone *pZone, int nGoalID, bool bComplete );
+	bool ScriptTaskSetComplete( CScenarioZone *pZone, int nGoalID, int nTaskIdx, bool bComplete );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+NDb::CSide *GetSideForScenario( CScenarioTracker *pScenario );
+CScenarioTracker *CreateScenarioTracker( int nID );
+////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+//
+#endif __SCENARIOTRACKER_H_

@@ -1,0 +1,616 @@
+#include "StdAfx.h"
+#include "Gfx.h"
+#include "iMain.h"
+#include "G2DView.h"
+#include "RPGGlobal.h"
+#include "wInterface.h"
+#include "..\DBFormat\DataDifficulty.h"
+#include "..\MiscDll\Commands.h"
+#include "..\Input\Bind.h"
+#include "..\DBFormat\DataFormat.h"
+#include "..\DBFormat\DataInterface.h"
+#include "..\DBFormat\DataScenario.h"
+#include "Interface.h"
+#include "iCommonUI.h"
+#include "UIBaseCtrls.h"
+#include "UICommCtrls.h"
+#include "UIWrap.h"
+#include "iMission.h"
+#include "scScenarioTracker.h"
+#include "scFlowChartItems.h"
+#include "iShowObjectives.h"
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Retail objectives presentation and scenario-description value model.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NScenario
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NScenario::SGoalDescription::SGoalDescription( const SGoalDescription& )   @0x220370
+//   Compiler-generated member-wise copy: the CDBPtr AddRef rides CDBPtr's copy ctor; the vector copies.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+SGoalDescription::SGoalDescription( const SGoalDescription &src )
+	: pString( src.pString ), state( src.state ), tasks( src.tasks )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Retail scenario objective descriptions (v1.2 0x703120, 0x703eb0,
+// 0x704160, 0x704330). Script goals are only one source; placed clues have
+// their own persisted goals and tasks, with difficulty-dependent visibility.
+bool CScenarioTracker::IsClueDestroyed( CScenarioClue *pClue ) const
+{
+	return IsValid( pClue ) && ( pClue->IsDestroyed() ||
+		find( destroyedClues.begin(), destroyedClues.end(), pClue ) != destroyedClues.end() );
+}
+bool CScenarioTracker::IsClueInHand( const vector< CPtr<NWorld::CUnit> > &units, CScenarioClue *pClue ) const
+{
+	list< CPtr<CScenarioClue> > clues;
+	GetCluesInHand( units, &clues );
+	return find( clues.begin(), clues.end(), pClue ) != clues.end();
+}
+void CScenarioTracker::GetCluesFromZone( NRPG::CGlobalGame *pGame, CScenarioZone *pZone,
+	vector< CPtr<CScenarioClue> > *pClues )
+{
+	pClues->clear();
+	if ( !IsValid( pZone ) || !IsValid( pGame ) )
+		return;
+	bool bShowAll = pZone == GetZoneByName( "base" ) || pGame->pDifficulty->bShowAllScenarioGoals;
+	const vector< CPtr<CScenarioClue> > &clues = pZone->GetClues();
+	for ( int i = 0; i < clues.size(); ++i )
+	{
+		CScenarioClue *pClue = clues[i];
+		if ( IsValid( pClue->GetDBClue()->pGoal ) &&
+			( bShowAll || pClue->IsDetected() ) && pClue->IsPlaced() && !pClue->IsDestroyed() )
+			pClues->push_back( pClue );
+	}
+}
+EScenarioTaskState CScenarioTracker::GetTaskState( const vector< CPtr<NWorld::CUnit> > &units,
+	CScenarioTask *pTask ) const
+{
+	if ( !IsValid( pTask ) || !IsValid( pTask->GetDBTask() ) )
+		return STS_UNKNOWN;
+	switch ( pTask->GetDBTask()->eTag )
+	{
+	case NDb::TT_FIND_ITEM:
+	case NDb::TT_FIND_PERSON:
+		if ( pTask->IsDetected() )
+			return STS_COMPLETED;
+		break;
+	case NDb::TT_TAKE_ITEM:
+	case NDb::TT_TAKE_PERSON:
+		if ( IsClueDestroyed( pTask->GetParentClue() ) )
+			return STS_FAILED;
+		break;
+	case NDb::TT_CARRY_OUT_ITEM:
+	case NDb::TT_CARRY_OUT_PERSON:
+		return IsClueDestroyed( pTask->GetParentClue() ) ? STS_FAILED : STS_UNKNOWN;
+	case NDb::TT_COMPLETE_BY_SCRIPT:
+		return TaskStateToScenario( pTask->GetState() );
+	}
+	return pTask->GetState() == TS_COMPLETED || IsClueInHand( units, pTask->GetParentClue() ) ?
+		STS_COMPLETED : STS_UNKNOWN;
+}
+EScenarioTaskState CScenarioTracker::GetGoalDescription( SGoalDescription *pDescription,
+	const vector< CPtr<NWorld::CUnit> > &units, CScenarioGoal *pGoal ) const
+{
+	if ( !IsValid( pGoal ) )
+		return STS_COMPLETED;
+	const vector< CObj<CScenarioTask> > &tasks = pGoal->GetTasks();
+	EScenarioTaskState state = STS_COMPLETED;
+	for ( int i = 0; i < tasks.size() && state == STS_COMPLETED; ++i )
+	{
+		CScenarioTask *pTask = tasks[i];
+		if ( !pTask->IsVisible() )
+			continue;
+		STaskDescription task;
+		state = GetTaskState( units, pTask );
+		task.state = state;
+		task.pString = pTask->GetDescription();
+		pDescription->tasks.push_back( task );
+	}
+	for ( int i = 0; i < pDescription->tasks.size(); ++i )
+		if ( pDescription->tasks[i].state != STS_COMPLETED )
+			return STS_UNKNOWN;
+	return STS_COMPLETED;
+}
+void CScenarioTracker::GetGoalsFromZone( vector<SGoalDescription> *pGoals,
+	const vector< CPtr<NWorld::CUnit> > &units, NRPG::CGlobalGame *pGame )
+{
+	CScenarioZone *pZone = pGame->pCurrentZone;
+	if ( !IsValid( pZone ) )
+		return;
+	NDb::CString *pUnknown = NDb::GetString( 17776 );
+	vector< CPtr<CScenarioClue> > clues;
+	GetCluesFromZone( pGame, pZone, &clues );
+	bool bBase = pZone == GetZoneByName( "base" );
+	for ( int i = 0; i < clues.size(); ++i )
+	{
+		CScenarioClue *pClue = clues[i];
+		SGoalDescription goal;
+		bool bCompleted = false;
+		if ( bBase || pClue->IsDetected() || !pGame->pDifficulty->bUseDefaultStringForUnknownGoals )
+		{
+			goal.pString = pClue->GetDescription();
+			bCompleted = GetGoalDescription( &goal, units, pClue->GetGoal() ) == STS_COMPLETED &&
+				( IsClueFound( pClue ) || IsClueInHand( units, pClue ) );
+		}
+		else
+			goal.pString = pUnknown;
+		if ( bCompleted )
+			goal.state = STS_COMPLETED;
+		else if ( !IsValid( pClue ) || ( pClue->IsPlaced() && !IsClueFound( pClue ) && IsClueDestroyed( pClue ) ) )
+		{
+			goal.state = STS_FAILED;
+			for ( int t = 0; t < goal.tasks.size(); ++t )
+				if ( goal.tasks[t].state == STS_UNKNOWN )
+					goal.tasks[t].state = STS_FAILED;
+		}
+		pGoals->push_back( goal );
+	}
+	const vector< CObj<CScenarioGoal> > &scriptGoals = pZone->GetScriptGoals();
+	for ( int i = 0; i < scriptGoals.size(); ++i )
+	{
+		CScenarioGoal *pGoal = scriptGoals[i];
+		if ( !IsValid( pGoal ) )
+			continue;
+		SGoalDescription goal;
+		if ( IsValid( pGoal->GetDBGoal() ) )
+		{
+			goal.state = TaskStateToScenario( pGoal->GetState() );
+			goal.pString = pGoal->GetDBGoal()->pName;
+			GetGoalDescription( &goal, units, pGoal );
+		}
+		pGoals->push_back( goal );
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+} // namespace NScenario
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NUI
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CClueLine -- one goal row: type/state/background images (weak child refs) + a description text widget.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CClueLine: public CWindow
+{
+	OBJECT_NOCOPY_METHODS(CClueLine)
+private:
+	CPtr<NGame::IMission>		pMission;
+	NScenario::SGoalDescription	goal;
+	CPtr<CImage>				pType;
+	CPtr<CImage>				pState;
+	CPtr<CImage>				pBackgroundImage;
+	CObj<CText>					pDescription;
+	bool						bDoubleLine;
+
+public:
+	CClueLine(): bDoubleLine( false ) {}		// @0x220540  (default ctor: null members, empty goal)
+	CClueLine( const SWindowInfo &sInfo, NGame::IMission *pMission,
+			   const NScenario::SGoalDescription &goal, bool bDoubleLine );	// @0x21eaf0
+
+	// retail @0x2208b0: 1=CWindow base, 2=pMission, 3=goal (retail raw-DataChunks the whole
+	// SGoalDescription value, 0x14 bytes, pointers and all -- the dev POD fallback path does the
+	// same over the dev struct), 4=pType, 5=pState, 6=pBackgroundImage, 7=pDescription, 8=bDoubleLine
+	int operator&( CStructureSaver &f ) { f.Add(1,(CWindow*)this); f.Add(2,&pMission); f.Add(3,&goal); f.Add(4,&pType); f.Add(5,&pState); f.Add(6,&pBackgroundImage); f.Add(7,&pDescription); f.Add(8,&bDoubleLine); return 0; }
+
+	bool ProcessMessage( const SEvent &sEvent );	// @0x21eb90
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NUI::CClueLine::CClueLine( SWindowInfo&, IMission*, SGoalDescription&, bool )   @0x21eaf0
+//   CWindow base from the SWindowInfo; AddRef the mission (CPtr op=); copy the goal value; null widgets.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CClueLine::CClueLine( const SWindowInfo &sInfo, NGame::IMission *pMission,
+					  const NScenario::SGoalDescription &goal, bool bDoubleLine )
+	: CWindow( sInfo ), pMission( pMission ), goal( goal ), bDoubleLine( bDoubleLine )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NUI::CClueLine::ProcessMessage   @0x21eb90
+//   TEMPLATELOAD       : build the description CText from the loader "text" control.
+//   TEMPLATELOADCOMPLETE: bind the named child images, push the goal text, branch on goal.state.
+// State image and background IDs below were recovered from raw disassembly.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CClueLine::ProcessMessage( const SEvent &sEvent )
+{
+	switch ( sEvent.nEvent )
+	{
+	case EVENT_TEMPLATELOAD:
+		pDescription = new CText( sEvent.pLoader->GetControl( "text" ) );
+		break;
+
+	case EVENT_TEMPLATELOADCOMPLETE:
+		{
+			pType            = GetUIWindow<CImage>( this, "type" );
+			pState           = GetUIWindow<CImage>( this, "state" );
+			pBackgroundImage = GetUIWindow<CImage>( this, "background" );
+
+			if ( IsValid( pDescription ) )
+			{
+				NDb::CString *pStr = goal.pString;
+				pDescription->SetText( IsValid( pStr ) ? GetDBString( pStr ) : wstring( L"" ) );
+			}
+
+			// per-state UI-texture ids RECOVERED from raw disasm of @0x21eb90 (Ghidra dropped the immediates;
+			// verified: mov ecx,0x2bd/0x2bb/0x2be/0x2bc + add ecx,0x33e/0x340/0x33f, dbl-line delta +0x7e).
+			// pType = the "?" title glyph; pState = the small status icon (checkmark/cross/hidden).
+			const int nDbl = bDoubleLine ? 1 : 0;
+			switch ( goal.state )
+			{
+			case NScenario::STS_COMPLETED:	// @0x61ee86: glyph 0x2bb, checkmark 0x2bc, green bar 0x33f(+0x7e dbl)
+				if ( IsValid( pType ) )				pType->SetImage( NDb::GetUITexture( 0x2bb ) );
+				if ( IsValid( pState ) )			pState->SetImage( NDb::GetUITexture( 0x2bc ) );
+				if ( IsValid( pBackgroundImage ) )	pBackgroundImage->SetImage( NDb::GetUITexture( 0x33f + nDbl * 0x7e ) );
+				break;
+			case NScenario::STS_FAILED:		// @0x61edf3: glyph 0x2bb, cross 0x2be, bar 0x340(+0x7e dbl)
+				if ( IsValid( pType ) )				pType->SetImage( NDb::GetUITexture( 0x2bb ) );
+				if ( IsValid( pState ) )			pState->SetImage( NDb::GetUITexture( 0x2be ) );
+				if ( IsValid( pBackgroundImage ) )	pBackgroundImage->SetImage( NDb::GetUITexture( 0x340 + nDbl * 0x7e ) );
+				break;
+			default:	// @0x61ed96 (STS_UNKNOWN/active): glyph 0x2bd, hide the state icon, bar 0x33e(+0x7e dbl)
+				if ( IsValid( pType ) )				pType->SetImage( NDb::GetUITexture( 0x2bd ) );
+				if ( IsValid( pState ) )			pState->SetStyle( STYLE_VISIBLE, false );
+				if ( IsValid( pBackgroundImage ) )	pBackgroundImage->SetImage( NDb::GetUITexture( 0x33e + nDbl * 0x7e ) );
+				break;
+			}
+			break;
+		}
+	}
+
+	return CWindow::ProcessMessage( sEvent );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CTaskLine -- one task row: state + background images (weak child refs) + a numbered description text.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CTaskLine: public CWindow
+{
+	OBJECT_NOCOPY_METHODS(CTaskLine)
+private:
+	int							nNumber;
+	CPtr<NGame::IMission>		pMission;
+	NScenario::STaskDescription	task;
+	CPtr<CImage>				pState;
+	CPtr<CImage>				pBackgroundImage;
+	CObj<CText>					pDescription;
+	bool						bDoubleLine;
+
+public:
+	CTaskLine(): nNumber( 0 ), bDoubleLine( false ) {}
+	CTaskLine( const SWindowInfo &sInfo, NGame::IMission *pMission,
+			   const NScenario::STaskDescription &task, int nNumber, bool bDoubleLine );	// @0x21ea80
+
+	// retail @0x220970: 1=CWindow base, 2=nNumber, 3=pMission, 4=task (raw 8-byte DataChunk over
+	// the STaskDescription value, as retail), 5=pState, 6=pBackgroundImage, 7=pDescription, 8=bDoubleLine
+	int operator&( CStructureSaver &f ) { f.Add(1,(CWindow*)this); f.Add(2,&nNumber); f.Add(3,&pMission); f.Add(4,&task); f.Add(5,&pState); f.Add(6,&pBackgroundImage); f.Add(7,&pDescription); f.Add(8,&bDoubleLine); return 0; }
+
+	bool ProcessMessage( const SEvent &sEvent );	// @0x21f020
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NUI::CTaskLine::CTaskLine   @0x21ea80
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CTaskLine::CTaskLine( const SWindowInfo &sInfo, NGame::IMission *pMission,
+					  const NScenario::STaskDescription &task, int nNumber, bool bDoubleLine )
+	: CWindow( sInfo ), nNumber( nNumber ), pMission( pMission ), task( task ), bDoubleLine( bDoubleLine )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NUI::CTaskLine::ProcessMessage   @0x21f020
+//   TEMPLATELOAD       : build the description CText from the loader "text" control.
+//   TEMPLATELOADCOMPLETE: bind "state"/"background" child images, push the "<n>. <desc>" text, then
+//   select the per-(state,double-line) UI textures. The ids/deltas were RECOVERED from the disassembly
+//   (0x61f1b2/0x61f222/0x61f292): UNKNOWN bg 0x2ba(+0x105 dbl), COMPLETED state 0x2bc / bg 0x33c(+0x84),
+//   FAILED state 0x2be / bg 0x33d(+0x84).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CTaskLine::ProcessMessage( const SEvent &sEvent )
+{
+	switch ( sEvent.nEvent )
+	{
+	case EVENT_TEMPLATELOAD:
+		pDescription = new CText( sEvent.pLoader->GetControl( "text" ) );
+		break;
+
+	case EVENT_TEMPLATELOADCOMPLETE:
+		{
+			pState           = GetUIWindow<CImage>( this, "state" );
+			pBackgroundImage = GetUIWindow<CImage>( this, "background" );
+
+			if ( IsValid( pDescription ) )
+			{
+				WCHAR wsBuffer[ 1024 ];
+				NDb::CString *pStr = task.pString;
+				swprintf( wsBuffer, L"%d. %s", nNumber, IsValid( pStr ) ? GetDBString( pStr ).c_str() : L"" );
+				pDescription->SetText( wsBuffer );
+			}
+
+			const int nDbl = bDoubleLine ? 1 : 0;
+			switch ( task.state )
+			{
+			case NScenario::STS_COMPLETED:
+				if ( IsValid( pState ) )			pState->SetImage( NDb::GetUITexture( 0x2bc ) );
+				if ( IsValid( pBackgroundImage ) )	pBackgroundImage->SetImage( NDb::GetUITexture( 0x33c + nDbl * 0x84 ) );
+				break;
+			case NScenario::STS_FAILED:
+				if ( IsValid( pState ) )			pState->SetImage( NDb::GetUITexture( 0x2be ) );
+				if ( IsValid( pBackgroundImage ) )	pBackgroundImage->SetImage( NDb::GetUITexture( 0x33d + nDbl * 0x84 ) );
+				break;
+			default:	// STS_UNKNOWN: hide the state icon, paint the generic background.
+				if ( IsValid( pState ) )			pState->SetStyle( STYLE_VISIBLE, false );
+				if ( IsValid( pBackgroundImage ) )	pBackgroundImage->SetImage( NDb::GetUITexture( 0x2ba + nDbl * 0x105 ) );
+				break;
+			}
+			break;
+		}
+	}
+
+	return CWindow::ProcessMessage( sEvent );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CShowObjectivesUI -- the objectives list window: a scrollable CListView of CClueLine goal rows, each
+// followed by its CTaskLine task rows, plus a "cancel" close button.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CShowObjectivesUI: public CWindow
+{
+	OBJECT_NOCOPY_METHODS(CShowObjectivesUI)
+private:
+	CPtr<NGame::IMission>					pMission;
+	CPtr<NScenario::CScenarioZone>			pZone;
+	CObj<CListView>							pObjectives;
+	CObj<CScrollWindow<CListView> >			pObjectivesView;
+	CObj<CFlashButton>						pCloseButton;
+
+public:
+	CShowObjectivesUI() {}
+	CShowObjectivesUI( const SWindowInfo &sInfo, NGame::IMission *pMission,
+					   NScenario::CScenarioZone *pZone );	// @0x21e550
+
+	// retail @0x220a30: 1=CWindow base, 2=pMission, 3=pZone, 4=pObjectives, 5=pCloseButton, 6=pObjectivesView
+	int operator&( CStructureSaver &f ) { f.Add(1,(CWindow*)this); f.Add(2,&pMission); f.Add(3,&pZone); f.Add(4,&pObjectives); f.Add(5,&pCloseButton); f.Add(6,&pObjectivesView); return 0; }
+
+	bool ProcessMessage( const SEvent &sEvent );	// @0x21f3c0
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NUI::CShowObjectivesUI::CShowObjectivesUI   @0x21e550
+//   CWindow base from the SWindowInfo; AddRef the mission + zone (CPtr op=); null the child slots.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CShowObjectivesUI::CShowObjectivesUI( const SWindowInfo &sInfo, NGame::IMission *pMission,
+									  NScenario::CScenarioZone *pZone )
+	: CWindow( sInfo ), pMission( pMission ), pZone( pZone )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NUI::CShowObjectivesUI::ProcessMessage   @0x21f3c0
+//   TEMPLATELOAD       : build the close button + scrollable list, then one CClueLine per goal and one
+//                        CTaskLine per task from GetGoalsFromZone( pZone ).
+//   TEMPLATELOADCOMPLETE: wire the panel's vertical scrollbar.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CShowObjectivesUI::ProcessMessage( const SEvent &sEvent )
+{
+	switch ( sEvent.nEvent )
+	{
+	case EVENT_TEMPLATELOAD:
+		{
+			pCloseButton = new CFlashButton( sEvent.pLoader->GetControl( "cancel" ) );
+
+			pObjectivesView = new CScrollWindow<CListView>( sEvent.pLoader->GetControl( "view" ) );
+			pObjectives = pObjectivesView->GetClientWindow();
+
+			vector< CPtr<NGame::IUnitTracker> > trackers;
+			pMission->GetUnits( &trackers );
+			vector< CPtr<NWorld::CUnit> > units;
+			for ( int i = 0; i < trackers.size(); ++i )
+				units.push_back( trackers[i]->GetUnit() );
+			vector< NScenario::SGoalDescription > goals;
+			NRPG::CGlobalGame *pGame = pMission->GetRPGGame();
+			pGame->pScenarioTracker->GetGoalsFromZone( &goals, units, pGame );
+
+			int nCount = 0;
+			CObj<CTextDraw> pTextCalc = new CTextDraw;
+			for ( vector< NScenario::SGoalDescription >::const_iterator iGoal = goals.begin(); iGoal != goals.end(); ++iGoal )
+			{
+				// Retail v1.2 0x61fe41..0x61fea2 measures at 489 virtual pixels wide;
+				// text taller than 20 pixels uses the double-line frame and background.
+				pTextCalc->SetSize( SPoint( 489, -1 ) );
+				pTextCalc->SetText( IsValid( iGoal->pString ) ? GetDBString( iGoal->pString ) : wstring() );
+				bool bDoubleLine = pTextCalc->GetSize( GetInterface()->GetView() ).y > 20;
+				CClueLine *pClueRow = new CClueLine(
+					SWindowInfo( pObjectives, SPoint( 0, 0 ), SPoint( 0, 0 ), "item", STYLE_ENABLED | STYLE_VISIBLE ),
+					pMission, *iGoal, bDoubleLine );
+				LoadTemplate( pClueRow, NDb::GetUIContainer( bDoubleLine ? 0x1c6 : 0x185 ) );
+				pObjectives->AddItem( nCount++, pClueRow );
+
+				int nTask = 1;
+				const vector< NScenario::STaskDescription > &tasks = iGoal->tasks;
+				for ( int t = 0; t < tasks.size(); ++t )
+				{
+					WCHAR wsNumber[32];
+					swprintf( wsNumber, L"%d. ", nTask );
+					wstring wsText = wsNumber;
+					if ( IsValid( tasks[t].pString ) )
+						wsText += GetDBString( tasks[t].pString );
+					pTextCalc->SetSize( SPoint( 489, -1 ) );
+					pTextCalc->SetText( wsText );
+					bDoubleLine = pTextCalc->GetSize( GetInterface()->GetView() ).y > 20;
+					CTaskLine *pTaskRow = new CTaskLine(
+						SWindowInfo( pObjectives, SPoint( 0, 0 ), SPoint( 0, 0 ), "task", STYLE_ENABLED | STYLE_VISIBLE ),
+						pMission, tasks[ t ], nTask++, bDoubleLine );
+					LoadTemplate( pTaskRow, NDb::GetUIContainer( bDoubleLine ? 0x1c7 : 0x187 ) );
+					pObjectives->AddItem( nCount++, pTaskRow );
+				}
+			}
+			break;
+		}
+
+	case EVENT_TEMPLATELOADCOMPLETE:
+		{
+			pObjectivesView->SetVScroll( GetUIWindow<CScroll>( this, "scroll" ) );
+			break;
+		}
+	}
+
+	return CWindow::ProcessMessage( sEvent );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+} // namespace NUI
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NGame
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CShowObjectivesInterface -- the modal "show objectives" screen (IInterfaceBase). Sibling of the
+// divergent CObjectivesInterface; carries the per-zone payload (mission + zone + reusable screenshot)
+// and exits the modal on close (no nEventID). Serialized in retail (part of the interface stack):
+// operator& @0x2203d0, id 0xB322513A.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CShowObjectivesInterface: public NMainLoop::IInterfaceBase
+{
+	OBJECT_BASIC_METHODS(CShowObjectivesInterface);
+private:
+	NInput::CBind						bindClose;
+	CPtr<IMission>						pMission;
+	CPtr<NScenario::CScenarioZone>		pZone;
+	CObj<NUI::ICursor>					pCursor;
+	CObj<NUI::CInterface>				pInterface;
+	CObj<NUI::CWindow>					pUI;
+	CObj<NUI::CScreenShot>				pScreenShot;
+
+public:
+	CShowObjectivesInterface(): bindClose( "cancel" ) {}		// @0x21e5b0
+	CShowObjectivesInterface( const CShowObjectivesInterface &src );	// @0x2201b0
+
+	// retail @0x2203d0: 2=pMission, 3=pZone, 4=pCursor, 5=pInterface, 6=pUI, 7=pScreenShot
+	// (no tag 1: the IInterfaceBase base is not serialized; bindClose is a POD bind, not saved)
+	int operator&( CStructureSaver &f ) { f.Add(2,&pMission); f.Add(3,&pZone); f.Add(4,&pCursor); f.Add(5,&pInterface); f.Add(6,&pUI); f.Add(7,&pScreenShot); return 0; }
+
+	void Initialize( IMission *pMission, NScenario::CScenarioZone *pZone, NUI::CScreenShot *pSrcShot );	// @0x21e640
+
+	void Step();										// @0x21e4f0
+	void OnGetFocus() {}								// @0x21e380  (no-op)
+	bool ProcessEvent( const NInput::SEvent &sEvent );		// @0x21e450
+	void RenderFrame();									// @0x21e4c0
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NGame::CShowObjectivesInterface::CShowObjectivesInterface( const& )   @0x2201b0
+//   Field copy: POD bind + each owned smart pointer (CPtr/CObj op= AddRefs on copy).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CShowObjectivesInterface::CShowObjectivesInterface( const CShowObjectivesInterface &src )
+	: NMainLoop::IInterfaceBase( src ),
+	  bindClose( src.bindClose ),
+	  pMission( src.pMission ),
+	  pZone( src.pZone ),
+	  pCursor( src.pCursor ),
+	  pInterface( src.pInterface ),
+	  pUI( src.pUI ),
+	  pScreenShot( src.pScreenShot )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NGame::CShowObjectivesInterface::Initialize   @0x21e640
+//   Stash mission+zone, build cursor/widget-interface, the "objectives" screenshot backdrop (reuse the
+//   supplied frozen shot if present, else a fresh black-and-white capture), then the objectives window
+//   from container 388 (the dev's orphan objectives container -- the retail container id was lost).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CShowObjectivesInterface::Initialize( IMission *_pMission, NScenario::CScenarioZone *_pZone, NUI::CScreenShot *_pSrcShot )
+{
+	pMission = _pMission;
+	pZone    = _pZone;
+
+	pCursor    = NUI::ICursor::Create();
+	pInterface = new NUI::CInterface( pCursor );
+
+	pScreenShot = new NUI::CScreenShot( NUI::SWindowInfo( pInterface, NUI::SPoint( 0, 0 ), NUI::SPoint( 1024, 768 ), "objectives", NUI::STYLE_ENABLED | NUI::STYLE_VISIBLE | NUI::STYLE_BOTTOMMOST ) );
+	if ( IsValid( _pSrcShot ) )
+	{
+		pScreenShot->SetTexture( _pSrcShot->GetTexture() );		// reuse the supplied frozen backdrop
+	}
+	else
+	{
+		pScreenShot->SetMode( NUI::CScreenShot::BLACKANDWHITE, CVec4( 0.5f, 0.5f, 0.5f, 1 ) );
+		pScreenShot->Generate();
+	}
+
+	pUI = new NUI::CShowObjectivesUI( NUI::SWindowInfo( pInterface, NUI::SPoint( 0, 0 ), NUI::SPoint( 1024, 768 ), "objectivesUI", NUI::STYLE_ENABLED ), pMission, pZone );
+	NUI::LoadTemplate( pUI, NDb::GetUIContainer( 388 ) );
+	pUI->ShowWindow( NUI::SWTYPE_SHOW );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NGame::CShowObjectivesInterface::Step   @0x21e4f0
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CShowObjectivesInterface::Step()
+{
+	MarkNewDGFrame();
+	if ( CanRender() )
+	{
+		pInterface->UpdateCursor();
+		pInterface->Step( GetTime() );
+		RenderFrame();
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NGame::CShowObjectivesInterface::ProcessEvent   @0x21e450
+//   Cursor first look (ignored); widget interface may consume; else the close bind exits the modal.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CShowObjectivesInterface::ProcessEvent( const NInput::SEvent &sEvent )
+{
+	pCursor->ProcessEvent( sEvent );
+
+	if ( pInterface->ProcessEvent( sEvent ) )
+		return true;
+
+	if ( bindClose.ProcessEvent( sEvent ) )
+	{
+		NMainLoop::Command( new NMainLoop::CICExitModal() );
+		return true;
+	}
+
+	return false;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NGame::CShowObjectivesInterface::RenderFrame   @0x21e4c0
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CShowObjectivesInterface::RenderFrame()
+{
+	NGScene::ClearScreen( CVec3( 0.5f, 0.5f, 0.5f ) );
+	pInterface->Draw( GetTime() );
+	NGScene::Flip();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NGame::CICShowObjectives::CICShowObjectives( IMission*, CScenarioZone*, CScreenShot* )   @0x21e9c0
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CICShowObjectives::CICShowObjectives( IMission *_pMission, NScenario::CScenarioZone *_pZone, NUI::CScreenShot *_pScreenShot )
+	: pMission( _pMission ), pScreenShot( _pScreenShot ), pZone( _pZone )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NGame::CICShowObjectives::CICShowObjectives( const& )   @0x21ffa0
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CICShowObjectives::CICShowObjectives( const CICShowObjectives &src )
+	: NMainLoop::CInterfaceCommand( src ),
+	  pMission( src.pMission ),
+	  pScreenShot( src.pScreenShot ),
+	  pZone( src.pZone )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// NGame::CICShowObjectives::Exec   @0x21ea00
+//   Guard on the zone (IsValid == not null + not being deleted, the retail byte[pZone+7]&0x80 destroyed
+//   check), then build + initialize + push the modal objectives screen.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CICShowObjectives::Exec()
+{
+	if ( !IsValid( pZone ) )
+		return;
+
+	CShowObjectivesInterface *pRes = new CShowObjectivesInterface();
+	pRes->Initialize( pMission, pZone, pScreenShot );
+	PushInterface( pRes );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+} // namespace NGame
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail saveload ids (serialization-convergence W3): the objectives modal + its rows are part of
+// the retail interface-stack save graph. (CICShowObjectives stays unregistered, as in retail.)
+using NUI::CShowObjectivesUI;
+using NUI::CClueLine;
+using NUI::CTaskLine;
+using NGame::CShowObjectivesInterface;
+REGISTER_SAVELOAD_CLASS( 0xB3225130, CShowObjectivesUI )
+REGISTER_SAVELOAD_CLASS( 0xB3225131, CClueLine )
+REGISTER_SAVELOAD_CLASS( 0xB3225132, CTaskLine )
+REGISTER_SAVELOAD_CLASS( 0xB322513A, CShowObjectivesInterface )

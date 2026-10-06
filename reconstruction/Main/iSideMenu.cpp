@@ -1,0 +1,353 @@
+#include "StdAfx.h"
+#include "Transform.h"
+#include "GView.h"
+#include "G2DView.h"
+#include "GSceneUtils.h"
+#include "wInterface.h"
+#include "Sound.h"
+#include "RWGame.h"
+#include "RWSound.h"
+#include "RPGGame.h"
+#include "RPGGlobal.h"
+#include "Interface.h"
+#include "iMain.h"
+#include "iRenderWorld.h"
+#include "iCommonUI.h"
+#include "iDesktopWindow.h"
+#include "iSideMenu.h"
+#include "iHeroMenu.h"
+#include "..\Misc\StrProc.h"
+#include "..\MiscDll\Commands.h"
+#include "..\Input\Bind.h"
+#include "..\DBFormat\DataMap.h"
+#include "..\DBFormat\DataRPG.h"
+#include "..\DBFormat\DataDifficulty.h"
+#include "..\DBFormat\DataSound.h"
+#include "..\DBFormat\DataFormat.h"
+#include "..\DBFormat\DataCamera.h"
+////////////////////////////////////////////////////////////////////////////////////////////////////
+const int
+	N_SIDE_AXIS = 1,
+	N_SIDE_ALLIES = 2,
+	N_SIDEMENU_CAMERA = 47,
+	N_SIDEMENU_TEMPLATE = 2387;
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NUI
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CScriptHoverButton
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CScriptHoverButton: public CHoverButton
+{
+	OBJECT_BASIC_METHODS(CScriptHoverButton);
+private:
+	ZDATA_(CHoverButton)
+	CPtr<NGame::CRenderBaseInterface> pInterface;
+	////
+	bool bHoverNotify;
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CHoverButton*)this); f.Add(2,&pInterface); f.Add(3,&bChecked); f.Add(4,&bHoverNotify); return 0; }
+	bool bChecked = false;
+
+protected:
+	void OnAction();
+
+public:
+	CScriptHoverButton() {}
+	CScriptHoverButton( const SWindowInfo &sInfo, NGame::CRenderBaseInterface *pInterface );
+
+	void SetChecked( bool bState ) { bChecked = bState; }   // selected/highlighted (retail: the menu script sets it)
+	bool IsChecked() const { return bChecked; }
+
+	void Draw( const STime &sTime, NGScene::I2DGameView *pView );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CScriptHoverButton::CScriptHoverButton( const SWindowInfo &sInfo, NGame::CRenderBaseInterface *_pInterface ):
+	CHoverButton( sInfo ), pInterface( _pInterface ), bHoverNotify( false )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CScriptHoverButton::Draw( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	if ( IsMouseCover() != bHoverNotify )
+	{
+		NWorld::CCommand *pCmd = 
+			new NWorld::CCmdCallScriptFunction( "OnScriptNotify", "si", GetWindowID().c_str(), IsMouseCover() ? 1 : 0 );
+		pInterface->Command( pCmd );
+	}
+
+	bHoverNotify = IsMouseCover();
+
+	// Keep the selected button visually highlighted: force the bracketed state-3 "selected" art while
+	// checked (the release does exactly this @0x1bec00 -- ForceState(bChecked, 3)).
+	ForceState( bChecked, 3 );
+
+	CHoverButton::Draw( sTime, pView );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CScriptHoverButton::OnAction()
+{
+	NWorld::CCommand *pCmd = new NWorld::CCmdCallScriptFunction( "OnScriptNotify", "si", GetWindowID().c_str(), 2 );
+	pInterface->Command( pCmd );
+
+	CHoverButton::OnAction();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CSideMenuUI
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// The retail side-menu container (353) has in-scene side hotspots, but no static bottom-panel
+// buttons. The release builds the visible buttons PROGRAMMATICALLY in two CButtonsLine
+// over the "line_1"/"line_2" template controls (the main-menu precedent) + adds a difficulty row.
+// Base is CDesktopWindow (the release's script-UI host). operator& 7 -> 15 tags (@0x23ed60).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CSideMenuUI: public CDesktopWindow
+{
+	OBJECT_BASIC_METHODS(CSideMenuUI);
+public:
+	enum ESide
+	{
+		SIDE_NONE,
+		SIDE_AXIS,
+		SIDE_ALLIES
+	};
+	enum EDifficulty
+	{
+		DIF_EASY,
+		DIF_HARD,
+		DIF_NORMAL
+	};
+
+private:
+	ZDATA_(CWindow)
+	CPtr<NGame::CRenderBaseInterface> pInterface;
+	////
+	ESide eSide;
+	EDifficulty eDifficulty;
+	CObj<CHoverButton> pBack;
+	CObj<CHoverButton> pNext;
+	CObj<CScriptHoverButton> pAxis;
+	CObj<CScriptHoverButton> pAllies;
+	CObj<CScriptHoverButton> pEasy;
+	CObj<CScriptHoverButton> pHard;
+	CObj<CScriptHoverButton> pNormal;
+	CObj<CScriptHoverButton> pAxisOnView;
+	CObj<CScriptHoverButton> pAlliesOnView;
+	CObj<CButtonsLine> pButtonsLine1;
+	CObj<CButtonsLine> pButtonsLine2;
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CDesktopWindow*)this); f.Add(2,&pInterface); f.Add(3,&eSide); f.Add(4,&eDifficulty); f.Add(5,&pBack); f.Add(6,&pNext); f.Add(7,&pAxis); f.Add(8,&pAllies); f.Add(9,&pEasy); f.Add(10,&pHard); f.Add(11,&pNormal); f.Add(12,&pAxisOnView); f.Add(13,&pAlliesOnView); f.Add(14,&pButtonsLine1); f.Add(15,&pButtonsLine2); return 0; }
+
+	// Build a script-notifying button into a CButtonsLine (the release's AddScriptHoverButton @0x1c5ba0:
+	// a CScriptHoverButton over the generic CButtonsLine::AddButton, NORMAL/HOVER/disabled captions).
+	CScriptHoverButton* AddScriptButton( CButtonsLine *pLine, const string &szID, int nCaption, int nToolTip )
+	{
+		CScriptHoverButton *pButton = new CScriptHoverButton( SWindowInfo( pLine, SPoint( 0, 0 ), SPoint( 0, 0 ), szID, STYLE_ENABLED | STYLE_VISIBLE ), pInterface );
+		// v1.2 0x63d7dd: selected captions use the brighter DB style 17338, not the normal
+		// style 11129. Put the style before the brackets so they share the caption's font.
+		pLine->AddButton( pButton, nToolTip,
+			GetDBString( 11129 ) + GetDBString( nCaption ),                 // normal
+			GetDBString( 11130 ) + GetDBString( nCaption ),                 // hover
+			GetDBString( 17338 ) + L"[ " + GetDBString( nCaption ) + L" ]", // state 3 = selected
+			L"" );                                                       // disabled (retail)
+		return pButton;
+	}
+
+	// Retail CSideMenuUI::Draw updates the bottom-panel selection highlights.
+	void UpdateChecked()
+	{
+		if ( IsValid( pAxis ) )         pAxis->SetChecked( eSide == SIDE_AXIS );
+		if ( IsValid( pAllies ) )       pAllies->SetChecked( eSide == SIDE_ALLIES );
+		if ( IsValid( pEasy ) )         pEasy->SetChecked( eDifficulty == DIF_EASY );
+		if ( IsValid( pHard ) )         pHard->SetChecked( eDifficulty == DIF_HARD );
+		if ( IsValid( pNormal ) )       pNormal->SetChecked( eDifficulty == DIF_NORMAL );
+	}
+
+public:
+	CSideMenuUI() {}
+	CSideMenuUI( const SWindowInfo &sInfo, NGame::CRenderBaseInterface *pInterface );
+
+	ESide GetSide() const { return eSide; }
+	EDifficulty GetDifficulty() const { return eDifficulty; }
+
+	void Draw( const STime &sTime, NGScene::I2DGameView *pView );
+	bool ProcessMessage( const SEvent &sEvent );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CSideMenuUI::CSideMenuUI( const SWindowInfo &sInfo, NGame::CRenderBaseInterface *_pInterface ):
+	CDesktopWindow( sInfo ), pInterface( _pInterface ), eSide( SIDE_NONE ), eDifficulty( DIF_EASY )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Retail v1.1 @0x63cd50 / v1.2 @0x63cae0: update the enabled/checked states before drawing.
+void CSideMenuUI::Draw( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	pNext->SetStyle( STYLE_ENABLED, eSide != SIDE_NONE );
+	UpdateChecked();
+	CDesktopWindow::Draw( sTime, pView );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CSideMenuUI::ProcessMessage( const SEvent &sEvent )
+{
+	switch( sEvent.nEvent )
+	{
+		case EVENT_NOTIFY:
+			{
+				if ( sEvent.szID == "axis" )        { eSide = SIDE_AXIS; return true; }
+				else if ( sEvent.szID == "allies" ) { eSide = SIDE_ALLIES; return true; }
+				else if ( sEvent.szID == "easy" )   { eDifficulty = DIF_EASY; return true; }
+				else if ( sEvent.szID == "hard" )   { eDifficulty = DIF_HARD; return true; }
+				else if ( sEvent.szID == "normal" ) { eDifficulty = DIF_NORMAL; return true; }
+
+				break;
+			}
+		case EVENT_TEMPLATELOAD:
+			{
+				// Retail's in-scene hotspots notify the script but have no text states.
+				// Visible captions belong only to the bottom-panel buttons.
+				pAxisOnView = new CScriptHoverButton( sEvent.pLoader->GetControl( "axis" ), pInterface );
+
+				pAlliesOnView = new CScriptHoverButton( sEvent.pLoader->GetControl( "allies" ), pInterface );
+
+				// The navigable buttons live in two CButtonsLine over the line_1/line_2 template controls.
+				pButtonsLine1 = new CButtonsLine( sEvent.pLoader->GetControl( "line_1" ) );
+				pButtonsLine2 = new CButtonsLine( sEvent.pLoader->GetControl( "line_2" ) );
+
+				pBack = pButtonsLine1->AddHoverButton( "cancel", 19250,
+					GetDBString( 11129 ) + GetDBString( 11174 ),
+					GetDBString( 11130 ) + GetDBString( 11174 ),
+					GetDBString( 17338 ) + GetDBString( 11174 ) );
+				pAxis   = AddScriptButton( pButtonsLine1, "axis",   11131, 19254 );
+				pAllies = AddScriptButton( pButtonsLine1, "allies", 11132, 19253 );
+				pNext = pButtonsLine1->AddHoverButton( "next", 19249,
+					GetDBString( 11129 ) + GetDBString( 16820 ),
+					GetDBString( 11130 ) + GetDBString( 16820 ),
+					GetDBString( 17339 ) + GetDBString( 16820 ) );
+
+				pEasy   = AddScriptButton( pButtonsLine2, "easy",   17329, 19246 );
+				pNormal = AddScriptButton( pButtonsLine2, "normal", 17330, 19247 );
+				pHard   = AddScriptButton( pButtonsLine2, "hard",   17331, 19248 );
+
+				break;
+			}
+	}
+
+	return CDesktopWindow::ProcessMessage( sEvent );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+} // NAMESPACE
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NGame
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CSideMenuInterface
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CSideMenuInterface: public CRenderBaseInterface
+{
+	OBJECT_BASIC_METHODS(CSideMenuInterface);
+private:
+	NInput::CBind bindClose, bindNext;
+
+	ZDATA_(CRenderBaseInterface)
+	CObj<NUI::CSideMenuUI> pSideMenuUI;
+public:
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CRenderBaseInterface*)this); f.Add(2,&pSideMenuUI); return 0; }
+
+public:
+	CSideMenuInterface();
+
+	void Initialize();
+
+	void Step();
+	bool ProcessEvent( const NInput::SEvent &sEvent );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CSideMenuInterface
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CSideMenuInterface::CSideMenuInterface():
+	bindClose( "cancel" ), bindNext( "next" )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CSideMenuInterface::Initialize()
+{
+	CRenderBaseInterface::Initialize( N_SIDEMENU_TEMPLATE );
+
+	CPtr<NDb::CDBCamera> pDBCamera = NDb::GetDBCamera( N_SIDEMENU_CAMERA );
+	ICamera::SCameraPos sCameraPos( pDBCamera->vAnchor, pDBCamera->fDistance, pDBCamera->fPitch, pDBCamera->fYaw, pDBCamera->fRoll, pDBCamera->fFOV );
+	GetCamera()->SetPlacement( sCameraPos );
+
+	pSideMenuUI = new NUI::CSideMenuUI( NUI::SWindowInfo( GetInterface(), NUI::SPoint( 0, 0 ), NUI::SPoint( 1024, 768 ), "mainmenuUI" ), this );
+	NUI::LoadTemplate( pSideMenuUI, NDb::GetUIContainer( 353 ) );
+	pSideMenuUI->ShowWindow( NUI::SWTYPE_SHOW );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CSideMenuInterface::ProcessEvent( const NInput::SEvent &sEvent )
+{
+	NInput::SetSection( "menu" );
+
+	if ( CRenderBaseInterface::ProcessEvent( sEvent ) )
+		return true;
+
+	if ( bindClose.ProcessEvent( sEvent ) )
+	{
+		NMainLoop::Command( new NMainLoop::CICExitModal() ); 
+		return true;
+	}
+	else if ( bindNext.ProcessEvent( sEvent ) )
+	{
+		// Side enums coincide with DB IDs, but difficulty enums do NOT. Retail v1.2
+		// 0x63e1e3..0x63e21a maps EASY=0 -> DB1, HARD=1 -> DB3, NORMAL=2 -> DB2.
+		// The localized captions call these Normal, Impossible and Hard, respectively.
+		// Guard the null-side case for direct binds too; Draw disables the Next button.
+		NDb::CSide *pDBSide = ( pSideMenuUI->GetSide() != NUI::CSideMenuUI::SIDE_NONE )
+			? NDb::GetDBSide( pSideMenuUI->GetSide() ) : 0;
+		NDb::CDBDifficulty *pDBDifficulty = 0;
+		switch ( pSideMenuUI->GetDifficulty() )
+		{
+		case NUI::CSideMenuUI::DIF_EASY: pDBDifficulty = NDb::GetDBDifficulty( 1 ); break;
+		case NUI::CSideMenuUI::DIF_HARD: pDBDifficulty = NDb::GetDBDifficulty( 3 ); break;
+		case NUI::CSideMenuUI::DIF_NORMAL: pDBDifficulty = NDb::GetDBDifficulty( 2 ); break;
+		}
+		if ( IsValid( pDBSide ) )
+			NMainLoop::Command( new NGame::CICHeroMenu( pDBSide, pDBDifficulty ) );
+		return true;
+	}
+
+	return false;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CSideMenuInterface::Step()
+{
+	CRenderBaseInterface::Step();
+
+	if ( CanRender() )
+	{
+		// Render the 3D world full-screen, exactly like the main menu (iMainMenu.cpp). The predecessor
+		// derived a sub-rect from a "clientview" UI control, but the retail side-menu container (353)
+		// ships no such control -> GetUIWindow fell back to a zero-size window -> zero camera screen-rect
+		// -> CRenderBaseInterface::RenderFrame skipped pScene->Draw -> no 3D backdrop (uncleared backbuffer)
+		// + "control clientview not found" spam. The release renders the menu world full-screen.
+		GetCamera()->SetScreenRect( CTRect<float>( 0.0f, 0.0f, 1.0f, 1.0f ) );
+
+		RenderFrame( GetTime(), GetCamera() );
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CICMainMenu
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CICSideMenu::CICSideMenu()
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CICSideMenu::Exec()
+{
+	CSideMenuInterface *pRes = new CSideMenuInterface;
+	pRes->Initialize();
+	PushInterface( pRes );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+using namespace NUI;
+REGISTER_SAVELOAD_CLASS( 0xB1112180, CSideMenuUI );
+REGISTER_SAVELOAD_CLASS( 0xB3601000, CScriptHoverButton );
+using namespace NGame;
+REGISTER_SAVELOAD_CLASS( 0xB111218A, CSideMenuInterface );

@@ -1,0 +1,554 @@
+#include "stdafx.h"
+#include "A5Script.h"
+#include "wMain.h"
+#include "wUnitServer.h"
+#include "wUnitCommands.h"
+#include "wUnitGroup.h"
+#include "wOSBase.h"
+#include "..\DBFormat\DataCamera.h"
+#include "..\MiscDll\LogStream.h"
+#include "..\Misc\RandomGen.h"
+#include "rpgGlobal.h"
+#include "scriptPtr.h"
+#include "aiPosition.h"
+#include "aiRoute.h"
+#include "..\DBFormat\DataRPG.h"
+#include "..\DBFormat\DataDifficulty.h"
+#include "..\DBFormat\DataFormat.h"
+#include "scriptCallLUA.h"
+#include "scriptCommon.h"
+#include "scriptPosition.h"
+#include "..\Script\lstate.h"
+#include "wDebris.h"
+//
+// lua_showlog (retail @0x9c70f8, default 0, saved; registered in the A5Script block)
+bool bShowLuaLog = false;
+//
+namespace NScript
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+static void ShowLuaLog( const string &szFuncName, int nThread, const vector<SLuaParams> &params, bool bOK );
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Retail v1.1 0x6e4890 / v1.2 0x6e4e80: enqueue on the player's commander,
+// not CUnitServer::Do. Scripts run after the world pose update; direct execution
+// exposes the old server pose when a custom idle is replaced by an action.
+void DoCommand( NWorld::CUnitServer *pUnit, NWorld::CCmd *pCmd, bool bContinue )
+{
+	if ( !IsValid( pCmd ) || !IsValid( pUnit ) )
+		return;
+	CPtr<NWorld::CCommander> pCommander = pUnit->GetPlayer()->GetCommander();
+	CPtr<NWorld::CCmd> pHoldCommand = pCmd;
+	pCommander->Do( new NWorld::CCmdSetCommand( pUnit, pCmd ) );
+	if ( bContinue )
+		pCommander->Do( new NWorld::CCmdSetCommand( pUnit, new NWorld::CCmdContinue() ) );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int luaGetParamCount( lua_State* pState )
+{
+	ASSERT( pState != 0 );
+	if ( pState == 0 )
+		return 0;
+	//
+	return lua_gettop( pState );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool luaPrepareData( lua_State* pState, 
+	string szFuncName, string szParams, CScript **ppScript, vector<SLuaParams> *pParams )
+{
+	*ppScript = 0;
+	ASSERT( pState != 0 );
+	if ( pState == 0 )
+		return false;
+	*ppScript = CDynamicCast<CScript>( pState->pContext );
+	if ( !IsValid( *ppScript ) )
+		*ppScript = GetScript();
+	if ( !IsValid( *ppScript ) )
+		return false;
+	ASSERT( (*ppScript)->m_state == pState );
+	if ( (*ppScript)->m_state != pState )
+		return false;
+	// retail @0x2e4c90: the arg check captures printable args when lua_showlog is on, and both
+	// outcomes are echoed through ShowLuaLog (the thread id is pState->pCT)
+	if ( szParams != "" && !(*ppScript)->CheckArgs( szParams.c_str(), szFuncName.c_str(), pParams, bShowLuaLog ) )
+	{
+		ShowLuaLog( szFuncName, (int)pState->pCT.GetPtr(), *pParams, false );
+		return false;
+	}
+	ShowLuaLog( szFuncName, (int)pState->pCT.GetPtr(), *pParams, true );
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+static bool luaOutDBUserData( const Script::Object &o )
+{
+	if ( luaIsDBPtr<NDb::CDBCamera>( o ) )
+	{
+		CDBPtr<NDb::CDBCamera> pDBCamera = luaGetDBPtr<NDb::CDBCamera>( o );
+		csScript << " CDBPtr -> Camera " << pDBCamera->GetRecordID() << endl;		
+		return true;
+	}
+	//
+	return false;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail NScript::luaOutUserData @0x2e3ef0: bPrint prints to csScript (the Out command); otherwise
+// a compact one-liner is RETURNED (the lua_showlog arg echo)
+static string luaOutUserData( void *pData, bool bPrint )
+{
+	if ( GetScript() == 0 )
+		return "";
+	CPtr<NWorld::CWorld> pWorld = GetScript()->pWorld;
+	if ( !IsValid( pWorld ) )
+		return "";
+	//
+	CObjectBase *pObject = ( CObjectBase * )pData;
+	CDynamicCast<NWorld::CUnitServer> pUS(pObject);
+	if (pUS)
+	{
+		string szName;
+		pWorld->GetUnitName( pUS, &szName );
+		if ( !bPrint )
+			return "Unit[" + szName + "]";
+		csScript << CC_WHITE << "Unit [" << CC_YELLOW << szName << CC_WHITE << "]" << endl;
+	}
+	else {
+		CDynamicCast<NWorld::CUnitGroup> pGroup(pObject);
+		if (pGroup)
+		{
+			if ( !bPrint )
+			{
+				char szBuf[32];
+				sprintf( szBuf, "UnitGroup %d", pGroup->GetID() );
+				return szBuf;
+			}
+			csScript << "UnitGroup " << pGroup->GetID() << endl;
+		}
+		else {
+			CDynamicCast<NAI::CAIRoute> pRoute(pObject);
+			if (pRoute)
+			{
+				if ( !bPrint )
+					return "Route";
+				csScript << "Route " << endl;
+			}
+			else {
+				CDynamicCast<CLUAObjectPosition> pPos(pObject);
+				if (pPos)
+				{
+					if ( !bPrint )
+					{
+						char szBuf[96];
+						sprintf( szBuf, "Position[ %g, %g, %g ]", pPos->ptPos.x, pPos->ptPos.y, pPos->ptPos.z );
+						return szBuf;
+					}
+					csScript << "Position ( " << pPos->ptPos.x << ", " << pPos->ptPos.y << ", " << pPos->ptPos.z << " )" << endl;
+				}
+				else {
+					CDynamicCast<NWorld::CObjectServerBase> pOS(pObject);
+					if (pOS)
+					{
+						string szName;
+						pWorld->GetObjectName(pOS, &szName);
+						if ( !bPrint )
+							return "Object[" + szName + "]";
+						csScript << CC_WHITE << "Object [" << CC_YELLOW << szName << CC_WHITE << "]" << endl;
+					}
+					else {
+						CDynamicCast<NWorld::CDFrozenItem> pItem(pObject);
+						if (pItem)
+						{
+							string szName;
+							pWorld->GetItemName(pItem, &szName);
+							if ( !bPrint )
+								return "Item[" + szName + "]";
+							csScript << CC_WHITE << "Item [" << CC_YELLOW << szName << CC_WHITE << "]" << endl;
+						}
+						else
+						{
+							CDynamicCast< CDBPtrWrapper<NDb::CDBCamera> > pDBCamera(pObject);
+							if (pDBCamera)
+							{
+								if ( !bPrint )
+									return "CDBCamera";
+								csScript << CC_WHITE << "CDBCamera" << endl;
+							}
+							else
+							{
+								if ( !bPrint )
+									return "Ptr[Unregistered CPtr or CObj target]";
+								csScript << CC_RED << "[Script] error: Unregistered CPtr or CObj target" << endl;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return "";
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail NScript::ShowLuaLog @0x2e49e0: lua_showlog echo of every script call --
+// "  LUA(<thread>):  fn(  args  )" (+" check failed" when the arg check rejected it)
+static void ShowLuaLog( const string &szFuncName, int nThread, const vector<SLuaParams> &params, bool bOK )
+{
+	if ( !bShowLuaLog )
+		return;
+	char szBuf[16];
+	sprintf( szBuf, "%x", nThread );
+	csScript << CC_GREY << "  LUA(" << szBuf << "):  " << CC_ORANGE << szFuncName.c_str();
+	csScript << "(  ";
+	string szArgs;
+	for ( vector<SLuaParams>::const_iterator i = params.begin(); i != params.end(); ++i )
+	{
+		if ( IsValid( i->p ) )
+			szArgs += luaOutUserData( i->p.GetPtr(), false ) + ", ";
+		else
+			szArgs += i->s + ", ";
+	}
+	if ( !params.empty() )
+	{
+		szArgs.resize( szArgs.size() - 2 );	// retail: the trailing ", " becomes a single space
+		szArgs += " ";
+	}
+	csScript << CC_WHITE << szArgs.c_str();
+	csScript << CC_ORANGE << " )";
+	if ( !bOK )
+		csScript << " check failed";
+	csScript << endl;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int luaOut(lua_State* state)
+{
+	Script script(state);
+	int nTop = script.GetTop();
+	for ( int i = 1; i <= nTop; ++i )
+	{
+		Script::Object o = script.GetObject(i);
+		if ( o.Tag() >= tagLuaCPtr )
+		{
+			switch ( o.Tag() )
+			{
+				case tagLuaCPtr:
+				case tagLuaCObj:
+					{
+						if ( !luaOutDBUserData( o ) )
+						{
+							if ( o.Tag() == tagLuaCPtr )
+								csScript << " CPtr -> ";
+							else if ( o.Tag() == tagLuaCObj )
+								csScript << " CObj -> ";
+							luaOutUserData( luaGetPtr( o ), true );
+						}
+					}
+					break;
+				default:
+					csScript << CC_RED << "[Script] error: Incorrect user tag ( " << o.Tag() << " )" << endl;
+					break;
+			}
+		}
+		else if ( o.IsUserData() )
+		{
+			csScript << CC_RED << "[Script] error: User data" << endl;
+			ASSERT( 0 ); // We can't work with user data
+			break;
+		}
+		else if ( o.IsNil() )
+			csScript << "NIL";
+		else if ( o.IsString() )
+			csScript << o.GetString();
+		else
+			ASSERT(0);
+	}
+	csScript << endl;
+	return 0;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+int luaRandom( lua_State* state )
+{
+	Script script(state);
+	if ( !script.GetObject( 1 ).IsNumber() )
+		script.PushNumber( 0 );
+	else if ( script.GetTop() == 0 )
+		script.PushNumber( random.Get() );
+	else if ( script.GetTop() > 1 )
+		script.PushNumber( random.Get( script.GetObject(1).GetInteger(), script.GetObject(2).GetInteger() ) );
+	else
+		script.PushNumber( random.Get( script.GetObject(1).GetInteger() ) );
+	return 1;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+BEGIN_SCRIPT_COMMAND( IsRealTime, "" )
+	if ( pScript->pWorld->IsRealTime() )
+		pScript->PushNumber( 1 );
+	else
+		pScript->PushNil();
+	return 1;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail @0x2e9880 (""): 1 if the path network still has pending pass-calc (recolour) jobs, else nil.
+// Common.l WaitForPassCalc() loops on it. In the dev pass-calc is normally synchronous, so this is
+// nil unless a recolour job is genuinely outstanding.
+BEGIN_SCRIPT_COMMAND( PassCalcerIsActive, "" )
+	if ( pScript->pWorld->GetPathNetwork()->HasPassCalcerJobs() )
+		pScript->PushNumber( 1 );
+	else
+		pScript->PushNil();
+	return 1;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool luaGetBool( const Script::Object &o )
+{
+	if ( o.IsNil() )
+		return false;
+	else
+		return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void luaMakeCallParamsVector( char *szParams, va_list *pL, vector< CObj<CLUACallParam> > *pParams )
+{
+	pParams->clear();
+	for ( char *pCh = szParams; *pCh != ( char )0; ++pCh )
+	{
+		switch ( *pCh )
+		{
+			case 'i':
+				pParams->push_back( new CLUACallParam( va_arg( *pL, int ) ) );
+				break;
+			case 'f':
+				pParams->push_back( new CLUACallParam( va_arg( *pL, float ) ) );
+				break;
+			case 's':
+				pParams->push_back( new CLUACallParam( string( va_arg( *pL, char * ) ) ) );
+				break;
+			case 'p':
+				pParams->push_back( new CLUACallParam( va_arg( *pL, CObjectBase * ) ) );
+				break;
+			default:
+				ASSERT( 0 );
+				pParams->push_back( new CLUACallParam() );
+				break;
+		}
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+static const int N_NO_TOP = -0xFFF;
+//
+static bool luaPushCallParameters( string szName, 
+	const vector< CObj<CLUACallParam> > &params, lua_State *pState )
+{
+	ASSERT( pState );
+	if ( !pState )
+		return false;
+	//
+	int nLuaTop = lua_gettop( pState );
+	StkId stackTop = pState->pCT->top;
+  lua_getglobal( pState, szName.c_str() );
+	if ( lua_isfunction( pState, -1 ) )
+	{
+		for ( vector< CObj<CLUACallParam> >::const_iterator i = params.begin(); i != params.end(); ++i )
+		{
+			switch ( (*i)->type )
+			{
+				case CLUACallParam::PT_INT:
+					lua_pushnumber( pState, (*i)->nInt );
+					break;
+				case CLUACallParam::PT_FLOAT:
+					lua_pushnumber( pState, (*i)->fFloat );
+					break;
+				case CLUACallParam::PT_STRING:
+					lua_pushstring( pState, (*i)->szString.c_str() );
+					break;
+				case CLUACallParam::PT_POINTER:
+					luaPushCPtr( pState, (*i)->pObject );
+					break;
+				case CLUACallParam::PT_TAGGED_POINTER:
+					lua_pushusertag( pState, (*i)->pObject, (*i)->nInt );
+					break;
+				default:
+					lua_pushnil( pState );
+					ASSERT( 0 ); // unknown parameter type
+					continue;
+			}
+		}
+		//
+		ASSERT( lua_gettop( pState ) - nLuaTop == params.size() + 1 ); // not all params was pushed in the stack
+		return true;
+	}
+	else
+	{
+		lua_pop( pState, 1 ); // pop function from stack
+		ASSERT( pState->pCT->top == stackTop ); // stack corrupted
+		return false;
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void luaCallFunction( CScript *pScript, int nCallInfo, const vector< CObj<CLUACallParam> > &params )
+{
+	// Retail v1.2 0x6e4130: begin on this script's current thread; the caller pumps it.
+	lua_State *pState = pScript->GetState();
+	lua_pushcallinfo( pState, nCallInfo );
+	for ( int i = 0; i < params.size(); ++i )
+	{
+		const CLUACallParam &param = *params[i];
+		switch ( param.type )
+		{
+			case CLUACallParam::PT_POINTER: luaPushCPtr( pState, param.pObject ); break;
+			case CLUACallParam::PT_INT: lua_pushnumber( pState, param.nInt ); break;
+			case CLUACallParam::PT_FLOAT: lua_pushnumber( pState, param.fFloat ); break;
+			case CLUACallParam::PT_STRING: lua_pushstring( pState, param.szString.c_str() ); break;
+			case CLUACallParam::PT_TAGGED_POINTER: lua_pushusertag( pState, param.pObject, param.nInt ); break;
+			default: lua_pushnil( pState ); break;
+		}
+	}
+	lua_startCall( pState, params.size(), 0 );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void luaCallFunction( string szName, const vector< CObj<CLUACallParam> > &params )
+{
+	lua_State *pState = 0;
+	CScript *pScript = GetScript();
+	if ( pScript )
+		pState = pScript->GetState();
+	if ( !pState )
+	{
+		ASSERT( 0 );
+		ScriptError( "script is unavailable at the moment" );
+		return;
+	}
+	//
+	StkId stackTop = pState->pCT->top;
+	//
+	CLuaThread *pOld = pState->pCT;
+	ASSERT( pOld );
+	lua_setThread( pState, lua_newThread( pState, szName.c_str() ) );   // retail @0x2e3c70: named after the called function
+	if ( luaPushCallParameters( szName, params, pState ) )
+		lua_startThread( pState, params.size() );
+	lua_setThread( pState, pOld );
+	ASSERT( pState->pCT->top == stackTop ); // stack corrupted or current thread was changed
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void luaCallFunction( string szName, char *szParams, ... )
+{
+	vector< CObj<CLUACallParam> > params;
+	va_list l;
+	va_start( l, szParams );
+	luaMakeCallParamsVector( szParams, &l, &params );
+	va_end( l );
+	luaCallFunction( szName, params );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//BEGIN_SCRIPT_COMMAND( LuaTest, "ns[Hello!]n[100]b[false]b[true]" )
+BEGIN_SCRIPT_COMMAND( LuaTest, "" )
+	//csSystem << luaParams[ 0 ].n << endl;
+	//csSystem << luaParams[ 1 ].s << endl;
+	//csSystem << luaParams[ 2 ].f << endl;
+	//csSystem << luaParams[ 3 ].b << endl;
+	//csSystem << luaParams[ 4 ].b << endl;
+
+
+	luaCallFunction( "UnexistentFunction", "ii", 100, 200 );
+	return 0;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+BEGIN_SCRIPT_COMMAND( Explosion, "ns" )
+	int nGrenadeID = luaParams[ 0 ].n;
+	string szWaypoint = luaParams[ 1 ].s;
+	//
+	CPtr<NAI::CAIRouteWaypoint> pWaypoint = pScript->pWorld->GetWaypoint( szWaypoint );
+	if ( IsValid( pWaypoint ) )
+		pScript->pWorld->AddGrenadeExplosion( pWaypoint->pos.GetCP(), NDb::GetRPGGrenade( nGrenadeID ), 0 );
+	return 0;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail @0x2e93c0: spawn effect <id> at the named waypoint (identity rotation, default floor -100).
+BEGIN_SCRIPT_COMMAND( AttachEffectToWaypoint, "ns" )
+	NDb::CTEffect *pTEffect = NDb::GetTEffect( luaParams[ 0 ].n );
+	if ( !IsValid( pTEffect ) )
+		return 0;
+	SRand rnd;
+	NDb::CEffect *pEffect = pTEffect->GetEffect( &rnd );
+	if ( !IsValid( pEffect ) )
+		return 0;
+	CPtr<NAI::CAIRouteWaypoint> pWaypoint = pScript->pWorld->GetWaypoint( luaParams[ 1 ].s );
+	if ( IsValid( pWaypoint ) )
+		pScript->pWorld->CreateParticle( pWaypoint->pos.GetCP(), QNULL, pEffect );
+	return 0;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail @0x2e9580: attach effect <id> to unit -- the effect plays on the unit, its glue-to-bone instances
+// riding the unit's skeleton (CDumbUnitServer::AttachEffect; Visit feeds it via AddParticleEffect).
+BEGIN_SCRIPT_COMMAND( AttachEffectToUnitBone, "nu" )
+	NDb::CTEffect *pTEffect = NDb::GetTEffect( luaParams[ 0 ].n );
+	if ( !IsValid( pTEffect ) )
+		return 0;
+	SRand rnd;
+	NDb::CEffect *pEffect = pTEffect->GetEffect( &rnd );
+	if ( !IsValid( pEffect ) )
+		return 0;
+	CDynamicCast<NWorld::CUnitServer> pUS( luaParams[ 1 ].p );
+	if ( pUS )
+		pUS->AttachEffect( pUS->GetWorld()->GetTime()->GetValue(), pEffect );
+	return 0;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+BEGIN_SCRIPT_COMMAND( GetTurn, "" )
+	pScript->PushNumber( pScript->pWorld->GetTurnID() );
+	return 1;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+BEGIN_SCRIPT_COMMAND( Difficulty, "n" )
+	pScript->pWorld->GetGlobalGame()->ChangeDifficulty( luaParams[ 0 ].n );
+	return 0;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+BEGIN_SCRIPT_COMMAND( IsEqual, "uu" )
+	if ( luaParams[ 0 ].p == luaParams[ 1 ].p )
+		pScript->PushNumber( 1 );
+	else
+		pScript->PushNil();
+	return 1;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void luaPushBool( lua_State *pState, bool bValue )
+{
+	if ( bValue )
+		lua_pushnumber( pState, 1 );
+	else
+		lua_pushnil( pState );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail @0x2e5570: store a campaign-global string var.
+BEGIN_SCRIPT_COMMAND( SetGlobalGameVar, "ss" )
+	pScript->GetGlobalGame()->SetGlobalVar( luaParams[ 0 ].s, luaParams[ 1 ].s );
+	return 0;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail @0x2e53f0: read a campaign-global string var; an unset var (empty result with an empty
+// default) pushes nil, otherwise the stored/default string.
+BEGIN_SCRIPT_COMMAND( GetGlobalGameVar, "ss[]" )
+	string szResult = pScript->GetGlobalGame()->GetGlobalVar( luaParams[ 0 ].s, luaParams[ 1 ].s );
+	if ( szResult.empty() && szResult == luaParams[ 1 ].s )
+		pScript->PushNil();
+	else
+		pScript->PushString( szResult.c_str() );
+	return 1;
+END_SCRIPT_COMMAND
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail @0x2e3830: push the size of the table at stack slot 1 (lua_getn), or nil when slot 1 is
+// missing or not a table. Operates directly on the lua stack (no luaPrepareData).
+int luaTableGetSize( lua_State* pState )
+{
+	ASSERT( pState != 0 );
+	if ( pState == 0 )
+		return 0;
+	Script script( pState );
+	if ( script.GetTop() < 1 || !script.GetObject( 1 ).IsTable() )
+		script.PushNil();
+	else
+		script.PushNumber( script.GetObject( 1 ).GetTableSize() );
+	return 1;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+//
+using namespace NScript;
+REGISTER_SAVELOAD_CLASS( 0x51822131, CLUACallParam )

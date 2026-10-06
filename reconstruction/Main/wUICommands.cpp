@@ -1,0 +1,65 @@
+#include "StdAfx.h"
+#include "wUICommands.h"
+#include "..\DBFormat\DataSound.h"		// complete NDb::CSound for CUICmdPlaySound's CDBPtr saveload factory
+//
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NWorld
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Every CUICmd gets a unique, monotonically increasing id at construction (release: file-scope counter).
+// The CScript id-queue tracks queued ids so lua WaitForUI(id)/IsUIActionIDPresent(id) can wait on a command.
+static int g_nUniqCmdID = 0;
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CUICmd::CUICmd()
+{
+	nID = ++g_nUniqCmdID;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CUICmd::CUICmd( int /*nPriority*/ )	// priority arg ignored (legacy non-camera subclasses); see header
+{
+	nID = ++g_nUniqCmdID;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+using namespace NWorld;
+REGISTER_SAVELOAD_CLASS( 0xB1011160, CUICmd )
+// (0xB1011163 CUICmdTurn / 0x53115181 CUICmdUnit / 0x51402133 CUICmdMoveCamera REMOVED -- W5
+// serialization-convergence: dev-only classes, ids ABSENT from retail; see wUICommands.h)
+REGISTER_SAVELOAD_CLASS( 0x02973150, CUICmdAIUnitWillMove )		// AI "unit will move" hint (release id, $E93 @0x4a94c0)
+REGISTER_SAVELOAD_CLASS( 0x53102130, CUICmdPlayDialog )
+REGISTER_SAVELOAD_CLASS( 0x50412160, CUICmdContinueChapter )
+REGISTER_SAVELOAD_CLASS( 0x51312180, CUICmdLoadTemplate )
+REGISTER_SAVELOAD_CLASS( 0xB1122080, CUICmdShowStore )
+REGISTER_SAVELOAD_CLASS( 0xB1122081, CUICmdShowTeamMng )
+REGISTER_SAVELOAD_CLASS( 0x52022180, CUICmdPlayAck )
+REGISTER_SAVELOAD_CLASS( 0x52022200, CUICmdSetFloor )
+REGISTER_SAVELOAD_CLASS( 0x52622200, CUICmdShowClue )
+REGISTER_SAVELOAD_CLASS( 0x53115170, CUICmdPartFinished )
+REGISTER_SAVELOAD_CLASS( 0xB3115171, CUICmdBeginSequence )
+REGISTER_SAVELOAD_CLASS( 0xB3115172, CUICmdEndSequence )
+REGISTER_SAVELOAD_CLASS( 0xB3130180, CUICmdPause )			// LUA convergence PART B
+REGISTER_SAVELOAD_CLASS( 0xA0623200, CUICmdLockCamera )		// LUA convergence PART B (release id; 0xA0623201 = ClipDistance)
+REGISTER_SAVELOAD_CLASS( 0xB3327131, CUICmdBeginZone )		// LUA convergence PART B (fresh id)
+REGISTER_SAVELOAD_CLASS( 0xA0723170, CUICmdPlaySound )		// LUA convergence PART B (fresh id)
+REGISTER_SAVELOAD_CLASS( 0xA2123160, CUICmdPlayEffect )		// LUA convergence PART B (fresh id)
+REGISTER_SAVELOAD_CLASS( 0xA1023120, CUICmdSetAmbient )		// LUA convergence PART B (fresh id)
+REGISTER_SAVELOAD_CLASS( 0xB3122180, CUICmdBeginFade )		// LUA convergence PART B (release id)
+REGISTER_SAVELOAD_CLASS( 0xB3122181, CUICmdEndFade )		// LUA convergence PART B (fresh id)
+REGISTER_SAVELOAD_CLASS( 0xB3523170, CUICmdLoseDialog )		// LUA convergence PART B (release id)
+REGISTER_SAVELOAD_CLASS( 0xB3130120, CUICmdLeaveZoneDlg )	// LUA convergence PART B (release id)
+REGISTER_SAVELOAD_CLASS( 0xB3212180, CUICmdShowHint )		// LUA convergence (release id; hint machinery)
+REGISTER_SAVELOAD_CLASS( 0xB3327132, CUICmdTutorialMode )	// LUA convergence (release id; hint machinery)
+REGISTER_SAVELOAD_CLASS( 0xB3621120, CUICmdLeaveZoneMode )	// LUA convergence (release id; SetLeaveZoneMode)
+REGISTER_SAVELOAD_CLASS( 0xB3327130, CUICmdPlayVideo )		// LUA convergence (release id; PlayVideo)
+REGISTER_SAVELOAD_CLASS( 0xA1023140, CUICmdSetAmbientEffect )	// LUA convergence (release id)
+REGISTER_SAVELOAD_CLASS( 0xB3630180, CUICmdFirstMissionMode )	// LUA convergence (fresh id; SetFirstMissionMode)
+REGISTER_SAVELOAD_CLASS( 0xB3924140, CUICmdEnableFeature )		// LUA convergence (fresh id; EnableFeature reenter)
+// release-new camera commands, on their REAL release ids (the dev CUICmdTurn/CUICmdMoveCamera/
+// CUICmdUnit classes that once squatted near these ids were removed in W5, matching the release).
+// CUICmdSetCameraClipDistance uses its real release id (0xA0623201, unused in dev).
+REGISTER_SAVELOAD_CLASS( 0xB1011161, CUICmdCameraLocator )
+REGISTER_SAVELOAD_CLASS( 0x51402130, CUICmdScriptMoveCamera )
+REGISTER_SAVELOAD_CLASS( 0xB1011162, CUICmdUnitCamera )
+REGISTER_SAVELOAD_CLASS( 0xA0623201, CUICmdSetCameraClipDistance )
+REGISTER_SAVELOAD_CLASS( 0x71007380, CUICmdPointCamera )		// real retail id (no dev collision)

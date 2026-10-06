@@ -1,0 +1,62 @@
+#ifndef __SOUND_H_
+#define __SOUND_H_
+#if _MSC_VER > 1000
+#pragma once
+#endif // _MSC_VER > 1000
+////////////////////////////////////////////////////////////////////////////////////////////////////
+#include "DG.h"
+#include "Time.h"
+
+namespace NDb
+{
+	class CSound;
+	class CMusic;
+	class CTMusic;
+	class CSoundEffect;
+	enum EMusicType : int;	// defined in DBFormat\DataSound.h (fixed underlying type for this opaque declaration)
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CTransformStack;
+namespace NSound
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CSound;
+class CSoundEffect;
+class ISound2D : public CObjectBase
+{
+public:
+	virtual bool IsPlaying() = 0;
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class ISoundScene: public CObjectBase
+{
+public:
+	virtual CSound* Add3DSound( NDb::CSound *pSample, CFuncBase<CVec3> *pPos, STime tStart ) = 0;
+	virtual ISound2D* Add2DSound( NDb::CSound *pSample, STime tStart = 0 ) = 0;
+	virtual CSoundEffect* AddEffect( NDb::CSoundEffect *pEff, STime stBeginTime, CFuncBase<STime> *pTime, CFuncBase<CVec3> *pPos, const vector<int> &flags ) = 0;
+
+	// retail ISoundScene::SetMusic(EMusicType) @0x304db0 (vtbl+0x1c): the edge-triggered music-type
+	// switch CMission::UpdateSound drives every frame (retail @0x1feb50 passes MT_AMBIENT/MT_COMBAT).
+	virtual void SetMusic( NDb::EMusicType eType ) = 0;
+	// maps onto the retail SetMusic(MT_AMBIENT) edge (retail FadeOutMusic @0x304c20 itself is the
+	// internal data-driven fade the machine calls through vtbl+0x20).
+	virtual void FadeOutMusic() = 0;
+	virtual void Draw( CTransformStack *pTS ) = 0;
+
+	// retail ISoundScene vtbl+0x28 (@0x304d80): freeze/resume every live channel (3D/2D/effects;
+	// the music stream keeps playing) -- driven by CMissionBase::OnLostFocus/OnGetFocus when a menu
+	// covers the mission.
+	virtual void Pause( bool bPause ) = 0;
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail NSound::CreateSoundScene @0x305ad0 takes BOTH music-template pools (ambient, combat) --
+// the ctor (@0x3058c0) stores them and the type machine chooses a weighted track on every launch.
+// The clock is required: retail serializes it with the music deadlines (scene tag 4).
+ISoundScene* CreateSoundScene( NDb::CTMusic *pAmbient, NDb::CTMusic *pCombat, CFuncBase<STime> *pTime );
+ISoundScene* CreateSoundScene( ISoundScene *pSource, CFuncBase<STime> *pTime );
+bool InitSound( HWND hWnd );
+bool SetModeFromConfig();
+void DoneSound();
+////////////////////////////////////////////////////////////////////////////////////////////////////
+}
+#endif

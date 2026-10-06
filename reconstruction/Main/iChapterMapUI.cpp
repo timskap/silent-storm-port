@@ -1,0 +1,1121 @@
+#include "StdAfx.h"
+#include "GView.h"
+#include "G2DView.h"
+#include "Transform.h"
+#include "GSceneUtils.h"
+#include "MemObject.h"
+#include "RPGGlobal.h"
+#include "Sound.h"
+#include "PolyUtils.h"
+#include "Interface.h"
+#include "iCommonUI.h"
+#include "iMission.h"
+#include "iGlobalMap.h"
+#include "iChapterMap.h"
+#include "iShowClue.h"
+#include "iShowMedal.h"
+#include "ScreenShot.h"
+#include "RPGUnit.h"
+#include "ChapterInfo.h"
+#include "iLogPanel.h"			// NUI::CLogPanel + STREAM_GAME (the chapter map's tag-19 log panel)
+#include "iChapterMapUI.h"
+#include "..\Misc\StrProc.h"
+#include "..\MiscDll\Commands.h"
+#include "..\Misc\RandomGen.h"
+#include "..\DBFormat\DataMap.h"
+#include "..\DBFormat\DataFormat.h"
+#include "..\DBFormat\DataInterface.h"
+#include "..\DBFormat\DataScenario.h"
+#include "scFlowChartItems.h"
+#include "scScenarioTracker.h"
+#include "UIWrap.h"
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NUI
+{
+const int
+	N_ZONE_SIZE									= 69,
+	N_RANDOMZONE_SIZE						= 49,
+	N_RANDOMZONE_TTL						= 10000,	// TimeToLife
+	N_RANDOMZONE_MIN_DIST				= 8,
+	N_RANDOMZONE_MAX_DIST				= 256,
+	N_RANDOMZONE_ROLLTRY_COUNT	= 100;
+const float
+	F_PATH_CHECKLEN = 50;
+const CVec4
+	V4_SECTOR_NORMALCOLOR = CVec4( 0.3f, 1, 0.3f, 0.5f ),
+	V4_SECTOR_SELECTEDCOLOR = CVec4( 1, 0.3f, 0.3f, 0.5f );
+////////////////////////////////////////////////////////////////////////////////////////////////////
+struct SCluesSort
+{
+	bool operator()( NScenario::CScenarioClue *p1, NScenario::CScenarioClue *p2 ) const 
+	{ 
+		return p1->GetOpenOrder() < p2->GetOpenOrder(); 
+	}
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CTeamMarker
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CTeamMarker: public CButton
+{
+	OBJECT_BASIC_METHODS(CTeamMarker);
+public:
+	enum EMode
+	{
+		MODE_MOVE,
+		MODE_NORMAL,
+		MODE_ZONE,
+		MODE_EXITZONE
+	};
+
+private:
+	ZDATA_(CButton)
+	EMode eMode, eTargetMode;
+	STime sMorphTime, sFlashTime;
+	////
+	CObj<CImageDraw> pMoving;
+	CObj<CImageDraw> pZone;
+	CObj<CImageDraw> pZoneFlash;
+	CObj<CImageDraw> pNormal;
+	CObj<CImageDraw> pNormalFlash;
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CButton*)this); f.Add(2,&eMode); f.Add(3,&eTargetMode); f.Add(4,&sMorphTime); f.Add(5,&sFlashTime); f.Add(6,&pMoving); f.Add(7,&pZone); f.Add(8,&pZoneFlash); f.Add(9,&pNormal); f.Add(10,&pNormalFlash); f.Add(11,&pToolTip); return 0; }
+	CPtr<CToolTip> pToolTip;
+
+public:
+	CTeamMarker() {}
+	CTeamMarker( const SWindowInfo &sInfo );
+
+	void SetMode( EMode eMode );
+
+	void Draw( const STime &sTime, NGScene::I2DGameView *pView );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CTeamMarker::CTeamMarker( const SWindowInfo &sInfo ):
+	CButton( sInfo ), eMode( MODE_NORMAL ), eTargetMode( MODE_NORMAL ), sMorphTime( 0 ), sFlashTime( 0 )
+{
+	CPtr<NDb::CUITexture> pNormalTexture = NDb::GetUITexture( 524 );
+	if ( IsValid( pNormalTexture ) )
+		SetSize( SPoint( pNormalTexture->nWidth, pNormalTexture->nHeight ) );
+
+	pMoving = new CImageDraw( SRect( 0, 0, GetSize().x, GetSize().y ), NDb::GetUITexture( 525 ) );
+	pZone = new CImageDraw( SRect( 0, 0, GetSize().x, GetSize().y ), NDb::GetUITexture( 530 ) );
+	pZoneFlash = new CImageDraw( SRect( 0, 0, GetSize().x, GetSize().y ), NDb::GetUITexture( 531 ) );
+	pNormal = new CImageDraw( SRect( 0, 0, GetSize().x, GetSize().y ), NDb::GetUITexture( 524 ) );
+	pNormalFlash = new CImageDraw( SRect( 0, 0, GetSize().x, GetSize().y ), NDb::GetUITexture( 526 ) );
+
+	// Retail v1.2 0x5ac456..0x5ac573: Draw updates this tooltip after load,
+	// so the marker must create and retain the object serialized in tag 11.
+	pToolTip = new CToolTip( SWindowInfo( GetInterface(), SPoint( 0, 0 ), SPoint( 0, 0 ), "tooltip", STYLE_ENABLED | STYLE_TOPMOST ) );
+	SetToolTip( pToolTip );
+	pToolTip->SetText( GetDBString( 11124 ) );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CTeamMarker::SetMode( EMode _eMode )
+{
+	eTargetMode = _eMode;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CTeamMarker::Draw( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	float fNormal = 0.0f, fMoving = 0.0f, fFlash = 0.0f;
+
+	if ( ( eMode != eTargetMode ) && ( sMorphTime + N_STANDART_MORPHTIME > sTime ) )
+	{
+		sFlashTime = sTime;
+
+		// Retail v1.2 0x5a94d2..0x5a9596 updates the localized action hint
+		// during the marker transition, not just when constructing the marker.
+		switch( eTargetMode )
+		{
+		case MODE_MOVE:
+			pToolTip->SetText( GetDBString( 11123 ) );
+			break;
+		case MODE_NORMAL:
+			pToolTip->SetText( GetDBString( 11124 ) );
+			break;
+		case MODE_ZONE:
+			pToolTip->SetText( GetDBString( 11126 ) );
+			break;
+		case MODE_EXITZONE:
+			pToolTip->SetText( GetDBString( 20253 ) );
+			break;
+		}
+
+		switch( eTargetMode )
+		{
+		case MODE_MOVE:
+			fMoving = float( sTime - sMorphTime ) / N_STANDART_MORPHTIME;
+			fNormal = 1.0f;
+			break;
+		case MODE_ZONE:
+		case MODE_EXITZONE:
+		case MODE_NORMAL:
+			fNormal = float( sTime - sMorphTime ) / N_STANDART_MORPHTIME;
+			fMoving = 1.0f;
+			break;
+		}
+	}
+	else
+	{
+		eMode = eTargetMode;
+		sMorphTime = sTime;
+
+		switch( eMode )
+		{
+		case MODE_MOVE:
+			fMoving = 1.0f;
+			break;
+		case MODE_ZONE:
+		case MODE_EXITZONE:
+		case MODE_NORMAL:
+			fNormal = 1.0f;
+			fFlash = float( ( sTime - sFlashTime ) % ( N_STANDART_FLASHTIME * 2 ) ) / N_STANDART_FLASHTIME;
+			if ( fFlash > 1 )
+				fFlash = 2 - fFlash;
+			if ( IsMouseCover() )
+			{
+				fFlash = 1.0f;
+				sFlashTime = sTime - N_STANDART_FLASHTIME;
+			}
+			break;
+		}
+	}
+
+	pMoving->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF * fMoving ) );
+	pZone->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF * fNormal ) );
+	pZoneFlash->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF * fFlash ) );
+	pNormal->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF * fNormal ) );
+	pNormalFlash->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF * fFlash ) );
+
+	switch( eTargetMode )
+	{
+	case MODE_MOVE:
+		if ( ( eMode == MODE_ZONE ) || ( eMode == MODE_EXITZONE ) )
+			pZone->Draw( this, sTime, pView );
+		else if ( eMode == MODE_NORMAL )
+			pNormal->Draw( this, sTime, pView );
+
+		pMoving->Draw( this, sTime, pView );
+
+		if ( ( eMode == MODE_ZONE ) || ( eMode == MODE_EXITZONE ) )
+			pZoneFlash->Draw( this, sTime, pView );
+		else if ( eMode == MODE_NORMAL )
+			pNormalFlash->Draw( this, sTime, pView );
+		break;
+	case MODE_ZONE:
+	case MODE_EXITZONE:
+		pMoving->Draw( this, sTime, pView );
+		pZone->Draw( this, sTime, pView );
+		pZoneFlash->Draw( this, sTime, pView );
+		break;
+	case MODE_NORMAL:
+		pMoving->Draw( this, sTime, pView );
+		pNormal->Draw( this, sTime, pView );
+		pNormalFlash->Draw( this, sTime, pView );
+		break;
+	}
+
+	CButton::Draw( sTime, pView );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CDescriptionText
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CDescriptionText: public CWindow
+{
+	OBJECT_BASIC_METHODS(CDescriptionText);
+public:
+	enum EMode
+	{
+		MODE_HIDDEN,
+		MODE_VISIBLE
+	};
+
+private:
+	ZDATA_(CWindow)
+	// retail tag 2: the owning mission back-pointer, stored by the ctor @0x1a9190 and handed in by
+	// CChapterMapUI::ProcessMessage @0x1abd20 (`CVar24 = this->pChapter`). Retail types it
+	// CPtr<NGame::IMission> because retail's CChapterMap IS-A CMissionBase IS-A IMission -- which is
+	// now literally true in this fork too (CChapterMap reparented onto CMissionBase; see
+	// iChapterMap.cpp), so this matches the retail decl exactly: the ctor @0x1a9190 signature is
+	// `CDescriptionText(CDescriptionText *this, SWindowInfo *, IMission *)`.
+	CPtr<NGame::IMission> pMission;
+	EMode eMode, eTargetMode;
+	STime sMorphTime;
+	float fCoeff;
+	////
+	CPtr<CText> pText;
+	CPtr<CImage> pBackground;
+	// retail CDescriptionText::operator& @0x1af050: 1=CWindow, 2=pMission, 3..6 the scalars,
+	// pBackground=7, pText=8 (a CObj in retail -- wire-compatible with our weak CPtr, since the CText
+	// is restored via CWindow's listChildren).
+	// dev's old scheme started at tag 2, shifting everything one low -> pText read fCoeff's bytes ->
+	// null -> SetStyle(null) AV (iChapterMapUI.cpp:265) on chapter-map save load.
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CWindow*)this); f.Add(2,&pMission); f.Add(3,&eMode); f.Add(4,&eTargetMode); f.Add(5,&sMorphTime); f.Add(6,&fCoeff); f.Add(7,&pBackground); f.Add(8,&pText); return 0; }
+
+public:
+	CDescriptionText() {}
+	CDescriptionText( const SWindowInfo &sInfo, NGame::IMission *pMission );
+
+	void Set( EMode eMode, const wstring &wsText = L"" );
+
+	bool ProcessMessage( const SEvent &sEvent );
+	bool Update( const STime &sTime, NGScene::I2DGameView *pView );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail ctor @0x1a9190: CWindow(sInfo) then stores the mission back-pointer (a refcounted CPtr
+// assign); the scalars keep their Jan03 seeds.
+CDescriptionText::CDescriptionText( const SWindowInfo &sInfo, NGame::IMission *_pMission ):
+	CWindow( sInfo ), pMission( _pMission ), eMode( MODE_HIDDEN ), eTargetMode( MODE_HIDDEN ), sMorphTime( 0 ), fCoeff( 0 )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CDescriptionText::Set( EMode _eMode, const wstring &wsText )
+{
+	if ( ( eTargetMode != _eMode ) && ( eTargetMode != eMode ) )
+		eMode = eTargetMode;
+
+	eTargetMode = _eMode;
+	pText->SetText( wsText );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CDescriptionText::ProcessMessage( const SEvent &sEvent )
+{
+	switch( sEvent.nEvent )
+	{
+	case EVENT_TEMPLATELOADCOMPLETE:
+		{
+			pText = GetUIWindow<CText>( this, "text" );
+			pBackground = GetUIWindow<CImage>( this, "background" );
+		}
+	}
+
+	return CWindow::ProcessMessage( sEvent );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CDescriptionText::Update( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	if ( eTargetMode != eMode )
+	{
+		if ( eTargetMode == MODE_HIDDEN )
+		{
+			fCoeff = CalcFlashCoeff( fCoeff, 0, sTime, sMorphTime );
+			if ( fCoeff == 0 )
+				eMode = eTargetMode;
+		}
+		else
+		{
+			fCoeff = CalcFlashCoeff( fCoeff, 1.0f, sTime, sMorphTime );
+			if ( fCoeff == 1.0f )
+				eMode = eTargetMode;
+		}
+
+		pText->SetStyle( STYLE_VISIBLE, false );
+		pBackground->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF * fCoeff ) );
+		SetStyle( STYLE_VISIBLE, true );
+	}
+	else
+	{
+		eMode = eTargetMode;
+
+		pText->SetStyle( STYLE_VISIBLE, true );
+		pBackground->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF ) );
+
+		if ( eMode == MODE_HIDDEN )
+			SetStyle( STYLE_VISIBLE, false );
+		else
+			SetStyle( STYLE_VISIBLE, true );
+	}
+
+	sMorphTime = sTime;
+	CWindow::Update( sTime, pView );
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CChapterSector
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CChapterSector: public CWindow
+{
+private:
+	ZDATA_(CWindow)
+	SChapterSector sSector;
+	////
+	bool bVisible;
+	bool bSelected;
+public:
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CWindow*)this); f.Add(2,&sSector); f.Add(3,&bVisible); f.Add(4,&bSelected); return 0; }
+
+public:
+	CChapterSector() {}
+	CChapterSector( const SWindowInfo &sInfo, const SChapterSector &sSector );
+
+	virtual bool CanEnter() const;
+	virtual bool CanDeploy() const { return true; }
+	virtual bool IsRecommended() const;
+	virtual bool GetDescription( wstring *psText ) const;
+
+	bool IsVisible() const;
+	void SetVisible( bool bState );
+
+	bool IsSelected() const;
+	void SetSelected( bool bState );
+
+	const SChapterSector& GetSector() const;
+
+	virtual void UpdateSector( const STime &sTime, const CVec2 &vTeamPose )= 0;
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CChapterSector::CChapterSector( const SWindowInfo &sInfo, const SChapterSector &_sSector ):
+	CWindow( sInfo ), sSector( _sSector ), bVisible( false ), bSelected( false )
+{
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CChapterSector::CanEnter() const
+{
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CChapterSector::IsRecommended() const
+{
+	return false;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CChapterSector::GetDescription( wstring *psText ) const
+{
+	return false;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CChapterSector::IsVisible() const
+{
+	return bVisible;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CChapterSector::SetVisible( bool bState )
+{
+	bVisible = bState;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CChapterSector::IsSelected() const
+{
+	return bSelected;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CChapterSector::SetSelected( bool bState )
+{
+	bSelected = bState;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+const SChapterSector& CChapterSector::GetSector() const
+{
+	return sSector;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CZoneSector
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CZoneSector: public CChapterSector
+{
+	OBJECT_BASIC_METHODS(CZoneSector)
+private:
+	ZDATA_(CChapterSector)
+	CPtr<NGame::IMission> pChapter;
+	CPtr<NScenario::CScenarioZone> pZone;
+	////
+	bool bVisited;
+	bool bRecommended;
+	////
+	float fCoeff;
+	STime sMorphTime;
+	CObj<CImageDraw> pFlash;
+	CObj<CImageDraw> pNormal;
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CChapterSector*)this); f.Add(2,&pChapter); f.Add(3,&pZone); f.Add(4,&bVisited); f.Add(5,&bRecommended); f.Add(6,&fCoeff); f.Add(7,&sMorphTime); f.Add(8,&pFlash); f.Add(9,&pNormal); return 0; }
+
+public:
+	CZoneSector() {}
+	CZoneSector( const SWindowInfo &sInfo, NGame::IMission *pChapter, const SChapterSector &sSector );
+
+	bool CanEnter() const;
+	bool CanDeploy() const;
+	bool IsRecommended() const;
+	bool GetDescription( wstring *psText ) const;
+
+	void UpdateSector( const STime &sTime, const CVec2 &vTeamPos );
+	void Draw( const STime &sTime, NGScene::I2DGameView *pView );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CZoneSector::CZoneSector( const SWindowInfo &sInfo, NGame::IMission *_pChapter, const SChapterSector &sSector ):
+	CChapterSector( sInfo, sSector ), pChapter( _pChapter ), bVisited( false ), bRecommended( false ), fCoeff( 0 ), sMorphTime( 0 )
+{
+	pFlash = new CImageDraw( SRect( 0, 0, GetSize().x, GetSize().y ) );
+	pNormal = new CImageDraw( SRect( 0, 0, GetSize().x, GetSize().y ) );
+
+	pZone = pChapter->GetRPGGame()->pScenarioTracker->GetZoneByDBZone( NDb::GetDBScenarioZone( GetSector().nTemplate ) );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CZoneSector::CanEnter() const
+{
+	// v1.2 0x5a99c0: unlike v1.1, scripts may enable re-entry of passed zones.
+	return IsVisible() && ( !bVisited || pChapter->CanReenterZone() );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CZoneSector::IsRecommended() const
+{
+	return bRecommended;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CZoneSector::CanDeploy() const
+{
+	// Retail v1.2 0x5a9e70, called separately from CanEnter by marker clicks.
+	CPtr<NRPG::CGlobalGame> pGame = pChapter->GetRPGGame();
+	return !IsValid( pZone ) || pZone->GetDBZone()->bAllowPK ||
+		pGame->players.empty() || !pGame->players[0]->IsAnybodyInPK();
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CZoneSector::GetDescription( wstring *psText ) const
+{
+	if ( GetSector().nDescriptionID == -1 )
+		return false;
+
+	*psText = GetDBString( GetSector().nDescriptionID );
+
+	CPtr<NRPG::CGlobalGame> pGame = pChapter->GetRPGGame();
+	if ( IsValid( pZone ) )
+	{
+		list< CPtr<NScenario::CScenarioClue> > cluesList;
+		pGame->pScenarioTracker->GetAvailableClues( &cluesList );
+		cluesList.sort( SCluesSort() );
+
+		int nCount = 0;
+		wstring wsDescr;
+		for ( list< CPtr<NScenario::CScenarioClue> >::const_iterator iTemp = cluesList.begin(); iTemp != cluesList.end(); iTemp++ )
+		{
+			if ( pGame->pScenarioTracker->GetZoneInWhichClueWasFound( (*iTemp) ) == pZone )
+			{
+				wsDescr += GetDBString( (*iTemp)->GetDBClue()->pDescription ).c_str();
+				wsDescr += L"<br>";
+				nCount++;
+			}
+		}
+
+		if ( nCount > 0 )
+		{
+			*psText += GetDBString( 0x4f35 );
+			*psText += wsDescr;
+		}
+	}
+
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CZoneSector::UpdateSector( const STime &sTime, const CVec2 &vTeamPos )
+{
+	if ( !IsValid( pZone ) )
+		return;
+
+	CPtr<NRPG::CGlobalGame> pGame = pChapter->GetRPGGame();
+
+	bool bHit = HitTest( vTeamPos.x, vTeamPos.y );
+	if ( bHit )
+		pGame->pScenarioTracker->RevealZone( pZone );
+
+	list<CPtr<NScenario::CScenarioZone> > zonesList;
+	pGame->pScenarioTracker->GetAvailableZones( &zonesList );
+
+	bRecommended = false;
+	SetVisible( false );
+	if ( find( zonesList.begin(), zonesList.end(), pZone ) != zonesList.end() )
+	{
+		SetVisible( true );
+		if ( pGame->pScenarioTracker->GetRecommendedZone( pGame->players.front() ) == pZone )
+			bRecommended = true;
+	}
+
+	bVisited = pZone->IsPassed();
+
+	if ( bHit && IsVisible() && NGlobal::GetVar( "cheat_zoneautocomplete" ).GetFloat() != 0 )
+		pGame->pScenarioTracker->CheatOpenZone( pZone );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CZoneSector::Draw( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	if ( !IsVisible() )
+		return;
+
+	CPtr<NDb::CUITexture> pNormalTexture, pFlashTexture;
+	if ( !bVisited )
+	{
+		pFlashTexture = NDb::GetUITexture( 546 );
+		pNormalTexture = NDb::GetUITexture( 520 );
+	}
+	else
+	{
+		pFlashTexture = NDb::GetUITexture( 547 );
+		pNormalTexture = NDb::GetUITexture( 521 );
+	}
+
+	float fTargetCoeff = IsSelected() ? 1.0f : 0.0f;
+	if ( !IsSelected() && bRecommended )
+	{
+		fTargetCoeff = float( sTime % ( N_STANDART_FLASHTIME * 2 ) ) / N_STANDART_FLASHTIME;
+		if ( fTargetCoeff > 1 )
+			fTargetCoeff = 2 - fTargetCoeff;
+	}
+	fCoeff = CalcFlashCoeff( fCoeff, fTargetCoeff, sTime, sMorphTime );
+	sMorphTime = sTime;
+
+	pNormal->SetImage( pNormalTexture );
+	pNormal->Draw( this, sTime, pView );
+
+	pFlash->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF * fCoeff ) );
+	pFlash->SetImage( pFlashTexture );
+	pFlash->Draw( this, sTime, pView );
+
+	CChapterSector::Draw( sTime, pView );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CRandomSector
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CRandomSector: public CChapterSector
+{
+	OBJECT_BASIC_METHODS(CRandomSector)
+private:
+	ZDATA_(CChapterSector)
+	CPtr<NGame::IMission> pChapter;
+	////
+	STime sUpdateTime;
+	CTRect<float> sZone;
+	////
+	float fCoeff;
+	STime sMorphTime;
+	CObj<CImageDraw> pMarker;
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CChapterSector*)this); f.Add(2,&pChapter); f.Add(3,&sUpdateTime); f.Add(4,&sZone); f.Add(5,&fCoeff); f.Add(6,&sMorphTime); f.Add(7,&pMarker); return 0; }
+
+public:
+	CRandomSector() {}
+	CRandomSector( const SWindowInfo &sInfo, NGame::IMission *pChapter, const SChapterSector &sSector );
+
+	void UpdateSector( const STime &sTime, const CVec2 &vTeamPos );
+	bool Update( const STime &sTime, NGScene::I2DGameView *pView );
+	void Draw( const STime &sTime, NGScene::I2DGameView *pView );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CRandomSector::CRandomSector( const SWindowInfo &sInfo, NGame::IMission *_pChapter, const SChapterSector &sSector ):
+	CChapterSector( sInfo, sSector ), pChapter( _pChapter ), sUpdateTime( 0 ), sZone( 0, 0, 0, 0 ), fCoeff( 0 ), sMorphTime( 0 )
+{
+	for ( int nPoint = 0; nPoint < sSector.pointsSet.size(); nPoint++ )
+	{
+		const CVec2 &vSectorPoint = sSector.pointsSet[nPoint];
+		sZone.x1 = min( sZone.x1, vSectorPoint.x );
+		sZone.x2 = max( sZone.x2, vSectorPoint.x );
+		sZone.y1 = min( sZone.y1, vSectorPoint.y );
+		sZone.y2 = max( sZone.y2, vSectorPoint.y );
+	}
+
+	pMarker = new CImageDraw( SRect( 0, 0, GetSize().x, GetSize().y ), NDb::GetUITexture( 519 ) );
+
+	CPtr<CToolTip> pToolTip = new CToolTip( SWindowInfo( GetInterface(), SPoint( 0, 0 ), SPoint( 0, 0 ), "tooltip", STYLE_ENABLED ) );
+	pToolTip->SetText( GetDBString( 5343 ) );
+	SetToolTip( pToolTip );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CRandomSector::UpdateSector( const STime &sTime, const CVec2 &vTeamPos )
+{
+	static SRand sRand;
+
+	vector<string> templParams;
+	if ( HitTest( vTeamPos.x, vTeamPos.y ) )
+		NMainLoop::CommandWithAutoSave( NStr::ToAscii( GetDBString( 20243 ) ), new NGame::CICBeginMission( GetSector().nTemplate, -1, templParams, pChapter->GetRPGGame(), pChapter->GetChapterMap()->pPWLImage ) );
+
+	if ( sUpdateTime > sTime )
+		return;
+
+	sUpdateTime = sTime + N_RANDOMZONE_TTL * sRand.GetFloat( 0.5f, 1.0f );
+	if ( !IsVisible() )
+	{
+		if ( sRand.Get( 100 ) < GetSector().nProbability )
+			return;
+
+		for ( int nTemp = 0; nTemp < N_RANDOMZONE_ROLLTRY_COUNT; nTemp++ )
+		{
+			CVec2 vPoint = CVec2( sRand.GetFloat( sZone.x1, sZone.x2 ), sRand.GetFloat( sZone.y1, sZone.y2 ) );
+
+			if ( !IsPointInPolygon( GetSector().pointsSet, vPoint ) )
+				continue;
+
+			float fDist = fabs( vTeamPos - vPoint );
+			if ( ( fDist < N_RANDOMZONE_MIN_DIST ) || ( fDist > N_RANDOMZONE_MAX_DIST ) )
+				continue;
+
+			SetVisible( true );
+
+			SPoint sMarkerPos;
+			const SPoint &sSize = GetSize();
+			GetParent()->ScreenToClient( SPoint( vPoint.x - sSize.x / 2, vPoint.y - sSize.y / 2 ), &sMarkerPos );
+			SetStyle( STYLE_VISIBLE, true );
+			SetPosition( sMarkerPos );
+		}
+	}
+	else
+	{
+		if ( sRand.Get( 100 ) < GetSector().nProbability / 4 )
+			return;
+
+		SetVisible( false );
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CRandomSector::Update( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	if ( IsVisible() )
+		fCoeff = CalcFlashCoeff( fCoeff, 1.0f, sTime, sMorphTime );
+	else
+		fCoeff = CalcFlashCoeff( fCoeff, 0.0f, sTime, sMorphTime );
+
+	sMorphTime = sTime;
+
+	CChapterSector::Update( sTime, pView );
+	return true;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CRandomSector::Draw( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	if ( !IsVisible() && ( fCoeff == 0.0f ) )
+	{
+		SetStyle( STYLE_VISIBLE, false );
+		return;
+	}
+
+	pMarker->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF * fCoeff ) );
+	pMarker->Draw( this, sTime, pView );
+
+	CChapterSector::Draw( sTime, pView );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CExitZoneSector
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class CExitZoneSector: public CChapterSector
+{
+	OBJECT_BASIC_METHODS(CExitZoneSector)
+private:
+	ZDATA_(CChapterSector)
+	CPtr<NGame::IMission> pChapter;
+	////
+	bool bRecommended;
+	////
+	float fCoeff;
+	STime sMorphTime;
+	CObj<CImageDraw> pFlash;
+	CObj<CImageDraw> pNormal;
+	ZEND int operator&( CStructureSaver &f ) { f.Add(1,(CChapterSector*)this); f.Add(2,&pChapter); f.Add(3,&bRecommended); f.Add(4,&fCoeff); f.Add(5,&sMorphTime); f.Add(6,&pFlash); f.Add(7,&pNormal); return 0; }
+
+public:
+	CExitZoneSector() {}
+	CExitZoneSector( const SWindowInfo &sInfo, NGame::IMission *pChapter, const SChapterSector &sSector );
+
+	void UpdateSector( const STime &sTime, const CVec2 &vTeamPos );
+	void Draw( const STime &sTime, NGScene::I2DGameView *pView );
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CExitZoneSector::CExitZoneSector( const SWindowInfo &sInfo, NGame::IMission *_pChapter, const SChapterSector &sSector ):
+	CChapterSector( sInfo, sSector ), pChapter( _pChapter ), bRecommended( false ), fCoeff( 0 ), sMorphTime( 0 )
+{
+	pFlash = new CImageDraw( SRect( 0, 0, GetSize().x, GetSize().y ), NDb::GetUITexture( 561 ) );
+	pNormal = new CImageDraw( SRect( 0, 0, GetSize().x, GetSize().y ), NDb::GetUITexture( 560 ) );
+
+	CPtr<CToolTip> pToolTip = new CToolTip( SWindowInfo( GetInterface(), SPoint( 0, 0 ), SPoint( 0, 0 ), "tooltip", STYLE_ENABLED ) );
+	pToolTip->SetText( GetDBString( 7542 ) );
+	SetToolTip( pToolTip );
+
+	SetVisible( true );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CExitZoneSector::UpdateSector( const STime &sTime, const CVec2 &vTeamPos )
+{
+	// retail @0x1aa690 decodes to:
+	//     GetRecommendedZone( pChapter->GetRPGGame()->pScenarioTracker,          // vt+0x130, +0x38
+	//                         pChapter->GetActivePlayer()->GetGlobalPlayer() );  // vt+0x5c, then +0x68
+	// (slot-walked, not guessed: CChapterMap vftable @0x4b9adc slot 23 = vt+0x5c =
+	// CMissionBase::GetActivePlayer @0x1a1950 and slot 76 = vt+0x130 = CMissionBase::GetRPGGame
+	// @0x19df10; CPlayerTracker vftable @0x4c1ac4 slot 26 = vt+0x68 = CPlayerTracker::GetGlobalPlayer
+	// @0x2878b0.) The old `pChapter->GetGlobalPlayer()` was an IChapterMap-ism -- IMission has no such
+	// accessor, so the reparent had to resolve it.
+	//
+	// We CANNOT spell it retail's way yet, and calling GetActivePlayer() here would be a guaranteed
+	// null deref: retail's CChapterMap::Initialize @0x1a6b30 builds a world + a CPlayerTracker per
+	// global player and sets pActivePlayer = playersSet[0], but this fork's CChapterMap::Initialize
+	// creates none of that (CPlayerTracker's ctor hard-requires pMission->GetWorld()->AddPlayer /
+	// GetPathNetwork, and the fork's chapter map has no world). Porting that world/tracker
+	// construction is a separate behaviour leg, NOT this serialization reparent.
+	// What is written below is retail's VALUE, exactly: retail's pActivePlayer is
+	// playersSet[0] == CPlayerTracker(this, pGlobalGame->players[0], ...), whose GetGlobalPlayer()
+	// @0x2878b0 returns that same pGlobalGame->players[0]. So GetActivePlayer()->GetGlobalPlayer()
+	// IS GetRPGGame()->players.front() -- the identical object, not an approximation of it. It is
+	// also byte-for-byte what this call site already resolved to before the reparent (the deleted
+	// CChapterMap::GetGlobalPlayer body was `ASSERT(players.size()==1); return players.front();`).
+	// Switch to the retail spelling when the chapter-map world/tracker port lands.
+	CPtr<NScenario::CScenarioZone> pRecomendedZone = pChapter->GetRPGGame()->pScenarioTracker->GetRecommendedZone( pChapter->GetRPGGame()->players.front() );
+
+	list<CPtr<NScenario::CScenarioZone> > zonesList;
+	pChapter->GetRPGGame()->pScenarioTracker->GetAvailableZones( &zonesList );
+
+	CDGPtr<CPtrFuncBase<CChapterInfo> > pChapterInfo = pChapter->GetChapterInfo();
+	pChapterInfo.Refresh();
+	CObj<CChapterInfo> pInfo = pChapterInfo->GetValue();
+
+	bRecommended = IsValid( pRecomendedZone );
+	for ( int nTemp = 0; nTemp < pInfo->sectorsSet.size(); nTemp++ )
+	{
+		SChapterSector &sChapterSector = pInfo->sectorsSet[nTemp];
+		if ( sChapterSector.eType != ZONE )
+			continue;
+
+		CPtr<NScenario::CScenarioZone> pZone = pChapter->GetRPGGame()->pScenarioTracker->GetZoneByDBZone( NDb::GetDBScenarioZone( sChapterSector.nTemplate ) );
+		if ( ( find( zonesList.begin(), zonesList.end(), pZone ) != zonesList.end() ) && ( pRecomendedZone == pZone ) )
+			bRecommended = false;
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CExitZoneSector::Draw( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	float fTargetCoeff = IsSelected() ? 1.0f : 0.0f;
+	if ( !IsSelected() && bRecommended )
+	{
+		fTargetCoeff = float( sTime % ( N_STANDART_FLASHTIME * 2 ) ) / N_STANDART_FLASHTIME;
+		if ( fTargetCoeff > 1 )
+			fTargetCoeff = 2 - fTargetCoeff;
+	}
+	fCoeff = CalcFlashCoeff( fCoeff, fTargetCoeff, sTime, sMorphTime );
+	sMorphTime = sTime;
+
+	pNormal->Draw( this, sTime, pView );
+
+	pFlash->SetColor( NGfx::SPixel8888( 0xFF, 0xFF, 0xFF, 0xFF * fCoeff ) );
+	pFlash->Draw( this, sTime, pView );
+	CChapterSector::Draw( sTime, pView );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// CChapterMapUI
+////////////////////////////////////////////////////////////////////////////////////////////////////
+CChapterMapUI::CChapterMapUI( const SWindowInfo &sInfo, NGame::IMission *_pChapter ):
+	CDesktopWindow( sInfo ), pChapter( _pChapter ), nWaitForSpecialFrame( 0 )
+{
+	// retail CChapterMapUI ctor @0x1aa1b0: disasm @0x5aa2a3 `mov ecx,1` -> NDb::GetUICursor(1) =
+	// UICursors row 1 "xz" (UITexture 295, NormalPen.cur) -- the chapter-map default cursor.
+	sCursor = SCursorInfo( NDb::GetUICursor( 1 ) );
+
+	CDGPtr<CPtrFuncBase<CChapterInfo> > pChapterInfo = pChapter->GetChapterInfo();
+	pChapterInfo.Refresh();
+	pInfo = pChapterInfo->GetValue();
+
+	vCurrentPos = pChapter->GetRPGGame()->vChapterPos;
+	vTargetPos = vCurrentPos;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CChapterMapUI::SetTarget( const CVec2 &_vTargetPos )
+{
+	vTargetPos = _vTargetPos;
+	float fXDelta = vTargetPos.x - vCurrentPos.x;
+	float fYDelta = vTargetPos.y - vCurrentPos.y;
+	if ( abs( fYDelta ) > abs( fXDelta ) )
+	{
+		fXK = fXDelta / abs( fYDelta );
+		fYK = fYDelta / abs( fYDelta );
+	}
+	else
+	{
+		fXK = fXDelta / abs( fXDelta );
+		fYK = fYDelta / abs( fXDelta );
+	}
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+bool CChapterMapUI::ProcessMessage( const SEvent &sEvent )
+{
+	switch( sEvent.nEvent )
+	{
+	case EVENT_NOTIFY:
+		{
+			if ( sEvent.szID == "action" )
+			{
+				bool bHandled = false;
+				for ( int nTemp = 0; nTemp < sectorsSet.size(); nTemp++ )
+				{
+					if ( !sectorsSet[nTemp]->CanEnter() || !sectorsSet[nTemp]->HitTest( vCurrentPos.x, vCurrentPos.y ) )
+						continue;
+
+					const SChapterSector &sSector = sectorsSet[nTemp]->GetSector();
+
+					if ( sSector.eType == ZONE )
+					{
+						if ( !sectorsSet[nTemp]->CanDeploy() )
+						{
+							// Handled: do not fall back to setting up camp.
+							bHandled = true;
+							csGame << GetDBString( 20995 ) << endl;
+							continue;
+						}
+						vector<string> templParams;
+						CPtr<NScenario::CScenarioZone> pZone = pChapter->GetRPGGame()->pScenarioTracker->GetZoneByDBZone( NDb::GetDBScenarioZone( sSector.nTemplate ) );
+						if ( IsValid( pZone ) )
+						{
+							bHandled = true;
+							NMainLoop::CommandWithAutoSave( NStr::ToAscii( GetDBString( 20243 ) ), new NGame::CICBeginMission( pZone, -1, templParams, pChapter->GetRPGGame(), false, pChapter->GetChapterMap()->pPWLImage ) );
+						}
+					}
+					else if ( sSector.eType == EXITZONE )
+					{
+						bHandled = true;
+						NMainLoop::Command( new NGame::CICContinueGlobal( pChapter->GetRPGGame() ) );
+					}
+				}
+
+				if ( !bHandled )
+				{
+					SRand sRand;
+					NDb::CChapterMap *pChapterMap = pChapter->GetChapterMap();
+					if ( !pChapterMap->campZonesSet.empty() )
+					{
+						int nID = sRand.Get( pChapterMap->campZonesSet.size() );
+
+						vector<string> templParams;
+						NMainLoop::CommandWithAutoSave( NStr::ToAscii( GetDBString( 20243 ) ), new NGame::CICBeginMission( pChapterMap->campZonesSet[nID], -1, templParams, pChapter->GetRPGGame(), pChapterMap->pPWLImage ) );
+					}
+				}
+
+				return true;
+			}
+
+			break;
+		}
+	case EVENT_MOUSEMOVE:
+		{
+			GetInterface()->SetCursorInfo( sCursor );
+			break;
+		}
+	case EVENT_TEMPLATELOAD:
+		{
+			pShowGlobal = new CFlashButton( sEvent.pLoader->GetControl( "showglobal" ) );
+
+			// retail @0x1abd20: both description panels are handed `this->pChapter` (decomp
+			// `CVar24 = this->pChapter; CDescriptionText::CDescriptionText(..., (IMission *)CVar24)`)
+			// -- that is the panel's tag-2 pMission.
+			pTextLeft = new CDescriptionText( sEvent.pLoader->GetControl( "text_left" ), pChapter );
+			pTextRight = new CDescriptionText( sEvent.pLoader->GetControl( "text_right" ), pChapter );
+
+			// retail @0x1abd20 builds the log panel here too, from the "logpanel" control with
+			// STREAM_GAME (decomp `EVar25 = STREAM_GAME; CLogPanel::CLogPanel(..., EVar25)`).
+			// Jan03 built it elsewhere; the decomp wins.
+			pLogPanel = new CLogPanel( sEvent.pLoader->GetControl( "logpanel" ), STREAM_GAME );
+			break;
+		}
+	case EVENT_TEMPLATELOADCOMPLETE:
+		{
+			pMapView = GetUIWindow<CWindow>( this, "view" );
+
+			pBackground = GetUIWindow<CImage>( this, "background" );
+			pBackground->SetImage( pChapter->GetChapterMap()->pBackground );
+
+			pTeamMarker = new CTeamMarker( SWindowInfo( pMapView, SPoint( vCurrentPos.x, vCurrentPos.y ), SPoint( 0, 0 ), "action", STYLE_ENABLED | STYLE_VISIBLE ) );
+
+			sectorsSet.reserve( pInfo->sectorsSet.size() );
+			for ( int nTemp = 0; nTemp < pInfo->sectorsSet.size(); nTemp++ )
+			{
+				SChapterSector &sChapterSector = pInfo->sectorsSet[nTemp];
+				if ( sChapterSector.pointsSet.empty() )
+					continue;
+
+				switch( sChapterSector.eType )
+				{
+				case ZONE:
+					{
+						SPoint sPosition;
+						const CVec2 &vPos = sChapterSector.pointsSet.front();
+						pMapView->ScreenToClient( SPoint( vPos.x, vPos.y ), &sPosition );
+						sectorsSet.push_back( new CZoneSector( SWindowInfo( pMapView, sPosition, SPoint( N_ZONE_SIZE, N_ZONE_SIZE ), "", STYLE_ENABLED | STYLE_VISIBLE | STYLE_BOTTOMMOST ), pChapter, sChapterSector ) );
+						break;
+					}
+				case RANDOM:
+					{
+						sectorsSet.push_back( new CRandomSector( SWindowInfo( pMapView, SPoint( 0, 0 ), SPoint( N_RANDOMZONE_SIZE, N_RANDOMZONE_SIZE ), "", STYLE_ENABLED | STYLE_VISIBLE | STYLE_BOTTOMMOST ), pChapter, sChapterSector ) );
+						break;
+					}
+				case EXITZONE:
+					{
+						SPoint sPosition;
+						const CVec2 &vPos = sChapterSector.pointsSet.front();
+						pMapView->ScreenToClient( SPoint( vPos.x, vPos.y ), &sPosition );
+						sectorsSet.push_back( new CExitZoneSector( SWindowInfo( pMapView, sPosition, SPoint( N_ZONE_SIZE, N_ZONE_SIZE ), "", STYLE_ENABLED | STYLE_VISIBLE | STYLE_BOTTOMMOST ), pChapter, sChapterSector ) );
+						break;
+					}
+				default:
+					ASSERT( 0 );
+					break;
+				}
+			}
+
+			break;
+		}
+	}
+
+	// retail @0x1abd20 chains the CDesktopWindow base (it is one) -- that is also what fills the base
+	// pClientWindow from the "view" control on EVENT_TEMPLATELOADCOMPLETE (CDesktopWindow tag 2).
+	if ( CDesktopWindow::ProcessMessage( sEvent ) )
+		return true;
+
+	switch( sEvent.nEvent )
+	{
+	case EVENT_LBUTTONUP:
+	{
+		if ( pMapView->HitTest( sEvent.nX, sEvent.nY ) )
+			SetTarget( CVec2( sEvent.nX, sEvent.nY ) );
+
+		return true;
+	}
+	case EVENT_LBUTTONDOWN:
+	case EVENT_LBUTTONDBLCLK:
+	case EVENT_RBUTTONUP:
+	case EVENT_RBUTTONDOWN:
+	case EVENT_RBUTTONDBLCLK:
+		return true;
+	}
+
+	return false;
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+void CChapterMapUI::Draw( const STime &sTime, NGScene::I2DGameView *pView )
+{
+	bool bMoving = false;
+	STime sTargetTime = sTime;
+	if ( fabs2( vTargetPos - vCurrentPos ) > 1 )
+	{
+		bMoving = true;
+
+		while ( ( fabs( vTargetPos - vCurrentPos ) > 1 ) && ( sLastUpdateTime < sTargetTime ) )
+		{
+			vCurrentPos.x += fXK;
+			vCurrentPos.y += fYK;
+			fPassedPathLen += ( fXK + fYK );
+
+			SPoint sTile( vCurrentPos.x, vCurrentPos.y );
+			float fSpeed = 20;
+
+			sLastUpdateTime = sLastUpdateTime + 1000.0f / fSpeed;
+
+			if ( fPassedPathLen > F_PATH_CHECKLEN )
+			{
+				fPassedPathLen -= F_PATH_CHECKLEN;
+
+				for ( int nTemp = 0; nTemp < sectorsSet.size(); nTemp++ )
+					sectorsSet[nTemp]->UpdateSector( sTime, vCurrentPos );
+			}
+		}
+	}
+
+	bool bHideLeft = true, bHideRight = true;
+	const SPoint &sCursorPos = GetInterface()->GetCursorPos();
+	for ( int nTemp = 0; nTemp < sectorsSet.size(); nTemp++ )
+	{
+		CChapterSector *pSector = sectorsSet[nTemp];
+		pSector->SetSelected( false );
+		if ( pSector->IsVisible() && pSector->HitTest( sCursorPos.x, sCursorPos.y ) )
+		{
+			wstring wsText;
+			if ( pSector->GetDescription( &wsText ) )
+			{
+				if ( sCursorPos.x > 512 )
+				{
+					bHideLeft = false;
+					pTextLeft->Set( CDescriptionText::MODE_VISIBLE, wsText );
+				}
+				else
+				{
+					bHideRight = false;
+					pTextRight->Set( CDescriptionText::MODE_VISIBLE, wsText );
+				}
+			}
+
+			pSector->SetSelected( true );
+		}
+
+		pSector->UpdateSector( sTime, vCurrentPos );
+	}
+	if ( bHideLeft )
+		pTextLeft->Set( CDescriptionText::MODE_HIDDEN );
+	if ( bHideRight )
+		pTextRight->Set( CDescriptionText::MODE_HIDDEN );
+
+	pChapter->GetRPGGame()->vChapterPos = vCurrentPos;
+	sLastUpdateTime = sTargetTime;
+
+	SPoint sPoint;
+	pMapView->ScreenToClient( SPoint( vCurrentPos.x, vCurrentPos.y ), &sPoint );
+
+	bool bHitSector = false;
+	EChapterSectorType eSectorType = RANDOM;
+	for ( int nTemp = 0; nTemp < sectorsSet.size(); nTemp++ )
+	{
+		if ( !sectorsSet[nTemp]->CanEnter() || !sectorsSet[nTemp]->HitTest( vCurrentPos.x, vCurrentPos.y ) )
+			continue;
+
+		bHitSector = true;
+		eSectorType = sectorsSet[nTemp]->GetSector().eType;
+		break;
+	}
+
+	const SPoint &sSize = pTeamMarker->GetSize();
+	pTeamMarker->SetPosition( SPoint( sPoint.x - sSize.x / 2, sPoint.y - sSize.y / 2 ) );
+	pTeamMarker->SetMode( bMoving ? CTeamMarker::MODE_MOVE : bHitSector ?
+		( eSectorType == ZONE ? CTeamMarker::MODE_ZONE : CTeamMarker::MODE_EXITZONE ) : CTeamMarker::MODE_NORMAL );
+
+	// retail @0x1aac20: the clue drain is gated on the SECOND frame -- nWaitForSpecialFrame is
+	// post-incremented every Draw and the drain runs only when it reaches 2, i.e. exactly once, on
+	// the frame after the map first painted (so a CICShowClue never covers a blank map).
+	nWaitForSpecialFrame++;
+	if ( nWaitForSpecialFrame == 2 )
+	{
+		list< CPtr<NScenario::CScenarioClue> > cluesList;
+		pChapter->GetRPGGame()->pScenarioTracker->GetAvailableClues( &cluesList );
+		cluesList.sort( SCluesSort() );
+		for( list< CPtr<NScenario::CScenarioClue> >::const_iterator iTemp = cluesList.begin(); iTemp != cluesList.end(); iTemp++ )
+		{
+			if ( !(*iTemp)->IsJustFound() )
+				continue;
+
+			NMainLoop::Command( new NGame::CICShowClue( 0, 0, pChapter->GetRPGGame(), pChapter->GetRPGGame()->players.front(), (*iTemp) ) );
+			(*iTemp)->SetJustFound( false );
+			if ( !pChapter->GetRPGGame()->players.empty() )
+				pChapter->GetRPGGame()->players.front()->AddMedalPointsForClue( pChapter->GetRPGGame() );
+		}
+
+		// Retail continues the same second-frame drain with every newly awarded medal of every roster
+		// merc. GetJustFoundMedals consumes the notification bit, so each popup is queued exactly once.
+		for ( vector< CObj<NRPG::CGlobalPlayer> >::iterator p = pChapter->GetRPGGame()->players.begin();
+			p != pChapter->GetRPGGame()->players.end(); ++p )
+		{
+			for ( vector< CObj<NRPG::CUnit> >::iterator u = (*p)->mercs.begin(); u != (*p)->mercs.end(); ++u )
+			{
+				vector< CDBPtr<NDb::CMedal> > medals;
+				(*u)->GetJustFoundMedals( &medals );
+				for ( int n = 0; n < medals.size(); ++n )
+				{
+					// Capture the already painted chapter map before any award modal is pushed.
+					CObj<NGScene::CScreenshotTexture> pScreenshot = new NGScene::CScreenshotTexture;
+					pScreenshot->Generate( true );
+					NMainLoop::Command( new NGame::CICShowMedal( (*p)->pSide, (*u)->GetName(), medals[n], pScreenshot ) );
+				}
+			}
+		}
+	}
+
+	CDesktopWindow::Draw( sTime, pView );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+} // NAMESPACE
+////////////////////////////////////////////////////////////////////////////////////////////////////
+using namespace NUI;
+REGISTER_SAVELOAD_CLASS( 0xB2606150, CTeamMarker );
+REGISTER_SAVELOAD_CLASS( 0xB2606152, CChapterMapUI );
+REGISTER_SAVELOAD_CLASS( 0xB2606153, CZoneSector );
+REGISTER_SAVELOAD_CLASS( 0xB2606154, CRandomSector );
+REGISTER_SAVELOAD_CLASS( 0xB2606155, CExitZoneSector );
+REGISTER_SAVELOAD_CLASS( 0xB2606156, CDescriptionText );
+////////////////////////////////////////////////////////////////////////////////////////////////////
+START_REGISTER(Gfx)
+	REGISTER_VAR( "cheat_zoneautocomplete", NULL, 0, false )
+FINISH_REGISTER

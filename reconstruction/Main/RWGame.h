@@ -1,0 +1,103 @@
+#ifndef __RWGAME_H_
+#define __RWGAME_H_
+#if _MSC_VER > 1000
+#pragma once
+#endif // _MSC_VER > 1000
+
+#include "Time.h"
+////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace NDb
+{
+	class CModel;
+	class CSequence;
+	class CAnimation;
+}
+namespace NWorld
+{
+	class IWorld;
+	struct IVisObj;
+	class IPlayer;
+}
+namespace NGScene
+{
+	class IGameView;
+}
+namespace NSound
+{
+	class ISoundScene;
+}
+class CTransformStack;
+namespace NRPG
+{
+	class CUnit;
+	class IUnitMissionInfo;
+}
+namespace NLSHead
+{
+	class CHeadsController;
+	class CHeadInfo;
+}
+namespace NRender
+{
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// game_selectionmode (v1.2-only int @0x9c70cc, default 0, saved): 0 = classic palette, 1 = flat
+// post-colorer palette, 2 = no selection visuals. Read by CSetRender::CreateSelection (v1.2
+// @0x6cbf60) and NGame::GetSelectionColor (v1.2 @0x5d6130).
+extern int nSelectionMode;
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class IShowUnit: public CObjectBase
+{
+public:
+	virtual void Update( float fAngle ) = 0;
+	// release IShowUnit vtbl+0x14 takes (lipsync seq, expression seq) -- retail CUnitView::SetSequence
+	// @0x1bf030 forwards both; the expression is the head animator's MASK entry. Defaulted so the
+	// one-sequence callers stay untouched.
+	virtual void SetSequence( NDb::CSequence *pSequence, NDb::CSequence *pExpression = 0 ) = 0;
+	// Play a body animation (idle/talk gesture) on the shown unit -- used by the unit-panel face.
+	// Default no-op (only CShowWorldUnit drives a skeletal animator); pass pAnim=0 to release.
+	virtual void PlayAnimation( NDb::CAnimation *pAnim, bool bLoop ) {}
+	// Live head-morph (advanced FaceGen editor): push a named tension param onto the shown head,
+	// read one back, and bake the current head into a CHeadInfo. Default no-ops (only CShowRPGUnit
+	// drives a morphable preview unit).
+	virtual void SetLSHeadParam( const char *szName, float fValue ) {}
+	virtual float GetLSHeadParam( const char *szName ) { return 0; }
+	virtual NLSHead::CHeadInfo* CreateLSHeadInfo() { return 0; }
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+class IRenderGame: public CObjectBase
+{
+public:
+	// retail Select @0x2cc850 takes (target, colour, bIgnoreFloorMask) and packs them into an
+	// NRender::SSelectionInfo (PDB: 20 bytes) for the render sets; the flag makes the scene-side
+	// selection skip its floor-mask gate. Every decoded dev-era caller passes false (e.g. the
+	// bomb highlight in UpdateVisible, disasm @0x6cf22c `push 0`), hence the default.
+	virtual CObjectBase* Select( CObjectBase *pSelect, const CVec4 &vColor = CVec4( 0, 1, 1, 1 ), bool bIgnoreFloorMask = false ) = 0;
+	virtual void FlashUnit( CObjectBase *pUnit, const CVec4 &vColor ) = 0;
+
+	virtual CCTime* GetTime() = 0;
+	virtual NLSHead::CHeadsController* GetHeadController() const = 0;
+
+	virtual void UpdateViewWorld( bool bAdvanceTime, STime currentTime, NWorld::IPlayer *pViewFrom, bool bShowAllUnits = false ) = 0;
+	virtual void FastUpdate( STime currentTime ) = 0;
+	virtual void ResetTiming() = 0;
+	// retail IRenderGame vtbl+0x30 @0x2cb1c0: advance BOTH sound mixers (world pSound + fog-gated
+	// pUnitSounds). The advance flag freezes both clocks while paused. CMissionBase now
+	// supplies GetGameTime(), following the intentional Sentinels sound-clock correction.
+	virtual void UpdateSound( bool bAdvanceTime, CTransformStack *pTS, STime currentTime ) = 0;	// retail @0x2cb1c0: (bool,...)
+};
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// retail CreateRenderGame @0x2d3aa0/ctor @0x2ceae0 takes the sound scene too: the render sounds are
+// OWNED by CRenderGame (pSound over GetActive, pUnitSounds over GetUnits) so UpdateVisible can
+// re-point pUnitSounds at the visibility-filtered source (voice fog-of-war).
+IRenderGame* CreateRenderGame( NWorld::IWorld *_pWorld, NGScene::IGameView *_pScene, NSound::ISoundScene *_pSoundScene );
+IRenderGame* CreateDummyRenderGame( NGScene::IGameView *_pScene );
+////
+IShowUnit* CreateShowUnit( NGScene::IGameView *pView, NRPG::CUnit *pUnit, CFuncBase<STime>* pTime, IRenderGame *pRenderGame = 0, bool bPlayIdleEmotions = true );
+// release @0x2ce9c0: the NWorld overload threads THREE bools into the CFakeWorldUnit ctor (@0x2ce440 params
+// 4-6: bItems, bPlayIdle, bShowCap). Defaults reproduce the old dev path (item pose flags on, static POSE,
+// cap shown) so existing callers keep their behavior. The NRPG overload exposes the facial-idle
+// flag separately: recruitment portraits disable it, while FaceGen keeps its live idle preview.
+IShowUnit* CreateShowUnit( NGScene::IGameView *pView, NWorld::CUnit *pUnit, CFuncBase<STime>* pTime, IRenderGame *pRenderGame = 0, bool bItems = true, bool bPlayIdle = false, bool bShowCap = true );
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+#endif
